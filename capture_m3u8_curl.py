@@ -549,6 +549,7 @@ async def settle_guarded_click(
     pages_before_click: list[Any],
     stable_url: str,
     wait_seconds: float,
+    reload_stable: bool = False,
 ) -> tuple[list[str], bool]:
     """Observe browser state without modifying site JavaScript."""
     popup_values: list[str] = []
@@ -582,11 +583,14 @@ async def settle_guarded_click(
                 file=sys.stderr,
             )
             recovered = True
-            try:
-                await page.go_back(wait_until="domcontentloaded", timeout=10_000)
-            except Exception:
-                pass
+            if not reload_stable:
+                try:
+                    await page.go_back(wait_until="domcontentloaded", timeout=10_000)
+                except Exception:
+                    pass
             if unexpected_interactive_navigation(page.url, stable_url):
+                await page.goto(stable_url, wait_until="domcontentloaded", timeout=20_000)
+            elif reload_stable:
                 await page.goto(stable_url, wait_until="domcontentloaded", timeout=20_000)
 
     if popup_values:
@@ -594,9 +598,9 @@ async def settle_guarded_click(
     return popup_values, recovered
 
 
-async def navigate_initial_page(page: Any, url: str, discovery: bool) -> None:
-    """Navigate once normally, or retry one initial discovery diversion."""
-    attempts = 2 if discovery else 1
+async def navigate_initial_page(page: Any, url: str) -> None:
+    """Navigate to the requested site and retry one blank/cross-origin diversion."""
+    attempts = 2
     for attempt in range(1, attempts + 1):
         timed_out = False
         try:
@@ -604,7 +608,7 @@ async def navigate_initial_page(page: Any, url: str, discovery: bool) -> None:
         except PlaywrightTimeoutError:
             timed_out = True
 
-        diverted = discovery and unexpected_interactive_navigation(page.url, url)
+        diverted = unexpected_interactive_navigation(page.url, url)
         if not diverted:
             if timed_out:
                 print("Page load timed out, but network capture is still active...", file=sys.stderr)
@@ -616,6 +620,36 @@ async def navigate_initial_page(page: Any, url: str, discovery: bool) -> None:
             )
 
     raise RuntimeError("initial page navigation repeatedly diverted away from the requested site")
+
+
+async def wait_for_capture_with_recovery(
+    page: Any,
+    found: asyncio.Future[Any],
+    pages_before_navigation: list[Any],
+    stable_url: str,
+    timeout: float,
+) -> Any:
+    """Wait for a captured request while restoring late browser diversions."""
+    deadline = asyncio.get_running_loop().time() + max(timeout, 0)
+    while True:
+        if found.done():
+            return found.result()
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise asyncio.TimeoutError
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(found),
+                timeout=min(0.1, remaining),
+            )
+        except asyncio.TimeoutError:
+            await settle_guarded_click(
+                page,
+                pages_before_navigation,
+                stable_url,
+                0,
+                reload_stable=True,
+            )
 
 
 async def wait_for_episode_grid_page(page: Any, expected_page: int, timeout: int = 5000) -> bool:
@@ -1049,10 +1083,11 @@ async def main() -> int:
         page.on("response", on_response)
 
         try:
-            await navigate_initial_page(page, args.url, args.discover_episode_urls)
+            await navigate_initial_page(page, args.url)
         except RuntimeError as exc:
             await context.close()
-            print(f"Discovery navigation failed: {exc}", file=sys.stderr)
+            stage = "Discovery" if args.discover_episode_urls else "Capture"
+            print(f"{stage} navigation failed: {exc}", file=sys.stderr)
             return 4
 
         if (
@@ -1134,7 +1169,13 @@ async def main() -> int:
             )
 
         try:
-            url, method, headers, post_data = await asyncio.wait_for(found, timeout=args.timeout)
+            url, method, headers, post_data = await wait_for_capture_with_recovery(
+                page,
+                found,
+                pages_before_navigation,
+                args.url,
+                args.timeout,
+            )
         except asyncio.TimeoutError:
             await context.close()
             print(

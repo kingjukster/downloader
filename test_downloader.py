@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import tempfile
 import time
 import unittest
@@ -546,7 +547,7 @@ class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(selected, created)
         context.new_page.assert_awaited_once_with()
 
-    async def test_initial_discovery_diversion_is_retried_once(self):
+    async def test_initial_diversion_is_retried_once_for_capture_too(self):
         target = "https://media.example/anime/1735?episode=23"
         page = mock.Mock(url="about:blank")
         attempts = 0
@@ -558,19 +559,46 @@ class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         page.goto = mock.AsyncMock(side_effect=navigate)
 
-        await capture.navigate_initial_page(page, target, discovery=True)
+        await capture.navigate_initial_page(page, target)
 
         self.assertEqual(page.goto.await_count, 2)
 
-    async def test_repeated_initial_discovery_diversion_fails_closed(self):
+    async def test_repeated_initial_diversion_fails_closed(self):
         target = "https://media.example/anime/1735?episode=23"
         page = mock.Mock(url="about:blank")
         page.goto = mock.AsyncMock()
 
         with self.assertRaisesRegex(RuntimeError, "repeatedly diverted"):
-            await capture.navigate_initial_page(page, target, discovery=True)
+            await capture.navigate_initial_page(page, target)
 
         self.assertEqual(page.goto.await_count, 2)
+
+    async def test_capture_wait_recovers_late_diversion_before_request(self):
+        page = mock.Mock(url="about:blank")
+        found = asyncio.get_running_loop().create_future()
+        captured_request = ("https://cdn.example/index.m3u8", "GET", {}, None)
+
+        async def recover(*args, **kwargs):
+            page.url = "https://media.example/anime/1735?episode=23"
+            if not found.done():
+                found.set_result(captured_request)
+            return [], True
+
+        with mock.patch.object(
+            capture,
+            "settle_guarded_click",
+            new=mock.AsyncMock(side_effect=recover),
+        ) as settle:
+            result = await capture.wait_for_capture_with_recovery(
+                page,
+                found,
+                [page],
+                "https://media.example/anime/1735?episode=23",
+                1,
+            )
+
+        self.assertEqual(result, captured_request)
+        settle.assert_awaited()
 
     async def test_browser_level_popup_containment_does_not_modify_site_javascript(self):
         page = mock.Mock(url="https://media.example/show")
@@ -593,6 +621,35 @@ class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(recovered)
         popup.close.assert_awaited_once_with()
         page.evaluate.assert_not_awaited()
+
+    async def test_capture_recovery_reloads_requested_page_instead_of_using_back(self):
+        stable = "https://media.example/anime/1735?episode=23"
+        page = mock.Mock(url="about:blank")
+        page.is_closed.return_value = False
+        page.wait_for_timeout = mock.AsyncMock()
+        page.go_back = mock.AsyncMock()
+
+        async def navigate(url, **kwargs):
+            page.url = url
+
+        page.goto = mock.AsyncMock(side_effect=navigate)
+        page.context = mock.Mock(pages=[page])
+
+        _, recovered = await capture.settle_guarded_click(
+            page,
+            [page],
+            stable,
+            0,
+            reload_stable=True,
+        )
+
+        self.assertTrue(recovered)
+        page.go_back.assert_not_awaited()
+        page.goto.assert_awaited_once_with(
+            stable,
+            wait_until="domcontentloaded",
+            timeout=20_000,
+        )
 
 
 if __name__ == "__main__":
