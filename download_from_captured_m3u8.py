@@ -348,7 +348,17 @@ def run_ffmpeg(
         cmd.extend(["-t", str(duration)])
     if header_blob:
         cmd.extend(["-headers", header_blob])
-    cmd.extend(["-i", m3u8_url, "-c", "copy", str(output)])
+    cmd.extend(
+        [
+            "-allowed_segment_extensions",
+            "ALL",
+            "-i",
+            m3u8_url,
+            "-c",
+            "copy",
+            str(output),
+        ]
+    )
 
     print("Downloading to:", output, file=sys.stderr)
     print("Running ffmpeg:", " ".join(shlex.quote(p) for p in cmd), file=sys.stderr)

@@ -26,6 +26,27 @@ def make_args(**overrides):
 
 
 class AutomaticExpansionTests(unittest.TestCase):
+    @mock.patch.object(downloader.subprocess, "call", return_value=0)
+    def test_ffmpeg_allows_extensionless_hls_segments_before_input(self, call):
+        with tempfile.TemporaryDirectory() as directory:
+            output = downloader.Path(directory) / "episode.mp4"
+
+            result = downloader.run_ffmpeg(
+                "ffmpeg",
+                "https://cdn.example/video/master.m3u8",
+                ["referer: https://media.example/"],
+                output,
+                None,
+                False,
+            )
+
+        self.assertEqual(result, 0)
+        command = call.call_args.args[0]
+        option_index = command.index("-allowed_segment_extensions")
+        input_index = command.index("-i")
+        self.assertEqual(command[option_index + 1], "ALL")
+        self.assertLess(option_index, input_index)
+
     def test_movie_output_uses_readable_title_and_year(self):
         self.assertEqual(
             downloader.default_output_path(
