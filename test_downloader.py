@@ -43,9 +43,12 @@ class AutomaticExpansionTests(unittest.TestCase):
         self.assertEqual(result, 0)
         command = call.call_args.args[0]
         option_index = command.index("-allowed_segment_extensions")
+        picky_index = command.index("-extension_picky")
         input_index = command.index("-i")
         self.assertEqual(command[option_index + 1], "ALL")
+        self.assertEqual(command[picky_index + 1], "0")
         self.assertLess(option_index, input_index)
+        self.assertLess(picky_index, input_index)
 
     def test_movie_output_uses_readable_title_and_year(self):
         self.assertEqual(

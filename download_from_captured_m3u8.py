@@ -352,6 +352,8 @@ def run_ffmpeg(
         [
             "-allowed_segment_extensions",
             "ALL",
+            "-extension_picky",
+            "0",
             "-i",
             m3u8_url,
             "-c",
