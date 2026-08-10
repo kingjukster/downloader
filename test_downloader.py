@@ -297,6 +297,34 @@ class EpisodeExtractionTests(unittest.TestCase):
 
 
 class PaginatedEpisodeGridTests(unittest.IsolatedAsyncioTestCase):
+    async def test_passive_discovery_does_not_auto_scroll(self):
+        page = mock.Mock()
+        page.wait_for_timeout = mock.AsyncMock()
+        with (
+            mock.patch.object(
+                capture,
+                "auto_scroll_page",
+                new=mock.AsyncMock(),
+            ) as auto_scroll,
+            mock.patch.object(
+                capture,
+                "collect_page_values",
+                new=mock.AsyncMock(
+                    return_value=["https://media.example/anime/1735?episode=23"]
+                ),
+            ),
+        ):
+            urls = await capture.discover_episode_urls(
+                page,
+                "https://media.example/anime/1735?episode=23",
+                5,
+                [],
+            )
+
+        auto_scroll.assert_not_awaited()
+        page.wait_for_timeout.assert_awaited_once_with(5000)
+        self.assertEqual(urls, ["https://media.example/anime/1735?episode=23"])
+
     async def test_accepts_grid_state_from_generic_all_episodes_marker(self):
         page = mock.Mock()
         page.evaluate = mock.AsyncMock(

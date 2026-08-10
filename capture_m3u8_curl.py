@@ -871,7 +871,6 @@ async def discover_episode_urls(
     if wait_seconds > 0:
         await page.wait_for_timeout(wait_seconds * 1000)
 
-    await auto_scroll_page(page)
     raw_values = [*captured_values, *await collect_page_values(page)]
     return extract_episode_urls_from_values(raw_values, base_url)
 
@@ -1078,7 +1077,6 @@ async def main() -> int:
 
         if args.discover_episode_urls:
             await page.wait_for_timeout(max(args.discover_wait, 0) * 1000)
-            await auto_scroll_page(page)
             discovery_values.extend(await collect_page_values(page))
             if args.discover_debug_output:
                 args.discover_debug_output.parent.mkdir(parents=True, exist_ok=True)
