@@ -472,7 +472,11 @@ async def click_episode_grid_control(page: Any, label: str | int) -> bool:
               const pagePattern = /\bPage\s+\d+\s+of\s+\d+/i;
               let root = marker.parentElement;
               while (root) {
-                if (pagePattern.test(textOf(root))) break;
+                const rootText = textOf(root);
+                const numericCount = Array.from(root.querySelectorAll('*')).filter(element =>
+                  /^\d+$/.test(textOf(element)) && visible(element)
+                ).length;
+                if (pagePattern.test(rootText) && numericCount >= 2) break;
                 if (root === document.body) {
                   root = null;
                   break;

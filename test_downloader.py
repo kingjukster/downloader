@@ -341,6 +341,21 @@ class PaginatedEpisodeGridTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["total_items"], 500)
         self.assertEqual(state["episode_numbers"], list(range(1, 101)))
 
+    async def test_grid_click_climbs_past_summary_only_header(self):
+        page = mock.Mock()
+
+        async def evaluate(script, argument):
+            self.assertIn("numericCount >= 2", script)
+            self.assertEqual(argument, {"label": "NEXT"})
+            return True
+
+        page.evaluate = mock.AsyncMock(side_effect=evaluate)
+
+        clicked = await capture.click_episode_grid_control(page, "NEXT")
+
+        self.assertTrue(clicked)
+        page.evaluate.assert_awaited_once()
+
     async def test_scans_pages_and_clicks_only_unresolved_episode_numbers(self):
         page = mock.Mock(url="https://media.example/show")
         page.wait_for_timeout = mock.AsyncMock()
