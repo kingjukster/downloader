@@ -297,6 +297,22 @@ class EpisodeExtractionTests(unittest.TestCase):
 
 
 class PaginatedEpisodeGridTests(unittest.IsolatedAsyncioTestCase):
+    async def test_accepts_grid_state_from_generic_all_episodes_marker(self):
+        page = mock.Mock()
+        page.evaluate = mock.AsyncMock(
+            return_value={
+                "summary": "All Episodes Page 1 of 5 - 500 total",
+                "episode_numbers": list(range(1, 101)),
+            }
+        )
+
+        state = await capture.episode_grid_state(page)
+
+        self.assertEqual(state["current_page"], 1)
+        self.assertEqual(state["total_pages"], 5)
+        self.assertEqual(state["total_items"], 500)
+        self.assertEqual(state["episode_numbers"], list(range(1, 101)))
+
     async def test_scans_pages_and_clicks_only_unresolved_episode_numbers(self):
         page = mock.Mock(url="https://media.example/show")
         page.wait_for_timeout = mock.AsyncMock()

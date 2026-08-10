@@ -382,12 +382,18 @@ async def episode_grid_state(page: Any) -> dict[str, Any] | None:
           };
           const textOf = element => (element.innerText || element.textContent || '')
             .replace(/\s+/g, ' ').trim();
-          const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'));
-          const heading = headings.find(element => /^All Episodes$/i.test(textOf(element)) && visible(element));
-          if (!heading) return null;
+          const markers = Array.from(document.querySelectorAll('body *'))
+            .filter(element => /^All Episodes$/i.test(textOf(element)) && visible(element));
+          markers.sort((a, b) => {
+            const aRect = a.getBoundingClientRect();
+            const bRect = b.getBoundingClientRect();
+            return (aRect.width * aRect.height) - (bRect.width * bRect.height);
+          });
+          const marker = markers[0];
+          if (!marker) return null;
 
           const pagePattern = /\bPage\s+\d+\s+of\s+\d+/i;
-          let root = heading.parentElement;
+          let root = marker.parentElement;
           while (root) {
             const rootText = textOf(root);
             const numericCount = Array.from(root.querySelectorAll('*')).filter(element =>
@@ -453,12 +459,18 @@ async def click_episode_grid_control(page: Any, label: str | int) -> bool:
               };
               const textOf = element => (element.innerText || element.textContent || '')
                 .replace(/\s+/g, ' ').trim();
-              const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'));
-              const heading = headings.find(element => /^All Episodes$/i.test(textOf(element)) && visible(element));
-              if (!heading) return false;
+              const markers = Array.from(document.querySelectorAll('body *'))
+                .filter(element => /^All Episodes$/i.test(textOf(element)) && visible(element));
+              markers.sort((a, b) => {
+                const aRect = a.getBoundingClientRect();
+                const bRect = b.getBoundingClientRect();
+                return (aRect.width * aRect.height) - (bRect.width * bRect.height);
+              });
+              const marker = markers[0];
+              if (!marker) return false;
 
               const pagePattern = /\bPage\s+\d+\s+of\s+\d+/i;
-              let root = heading.parentElement;
+              let root = marker.parentElement;
               while (root) {
                 if (pagePattern.test(textOf(root))) break;
                 if (root === document.body) {
