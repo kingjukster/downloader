@@ -509,10 +509,7 @@ def unexpected_interactive_navigation(current_url: str, stable_url: str) -> bool
     )
 
 
-async def install_discovery_popup_guard(page: Any) -> None:
-    """Block scripted pop-ups while retaining their target URLs for discovery."""
-    await page.evaluate(
-        r"""
+DISCOVERY_POPUP_GUARD_FUNCTION = r"""
         () => {
           if (window.__downloaderPopupGuardInstalled) return;
           window.__downloaderPopupGuardInstalled = true;
@@ -536,7 +533,17 @@ async def install_discovery_popup_guard(page: Any) -> None:
           };
         }
         """
-    )
+
+
+async def install_discovery_popup_guard(page: Any) -> None:
+    """Block scripted pop-ups while retaining their target URLs for discovery."""
+    await page.evaluate(DISCOVERY_POPUP_GUARD_FUNCTION)
+
+
+async def prepare_discovery_page(context: Any, page: Any) -> None:
+    """Install the guard before navigation and in the current startup document."""
+    await context.add_init_script(f"({DISCOVERY_POPUP_GUARD_FUNCTION})()")
+    await install_discovery_popup_guard(page)
 
 
 async def drain_blocked_popup_urls(page: Any) -> list[str]:
@@ -593,6 +600,30 @@ async def settle_guarded_click(
     if popup_values:
         print(f"Suppressed {len(popup_values)} unexpected pop-up target(s).", file=sys.stderr)
     return popup_values, recovered
+
+
+async def navigate_initial_page(page: Any, url: str, discovery: bool) -> None:
+    """Navigate once normally, or retry one initial discovery diversion."""
+    attempts = 2 if discovery else 1
+    for attempt in range(1, attempts + 1):
+        timed_out = False
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        except PlaywrightTimeoutError:
+            timed_out = True
+
+        diverted = discovery and unexpected_interactive_navigation(page.url, url)
+        if not diverted:
+            if timed_out:
+                print("Page load timed out, but network capture is still active...", file=sys.stderr)
+            return
+        if attempt < attempts:
+            print(
+                "Initial page navigation was diverted; retrying once under the discovery guard.",
+                file=sys.stderr,
+            )
+
+    raise RuntimeError("initial page navigation repeatedly diverted away from the requested site")
 
 
 async def wait_for_episode_grid_page(page: Any, expected_page: int, timeout: int = 5000) -> bool:
@@ -992,6 +1023,8 @@ async def main() -> int:
             args.extension_dir,
         )
         page = await reuse_or_create_context_page(context)
+        if args.discover_episode_urls:
+            await prepare_discovery_page(context, page)
 
         async def on_request(request):
             if found.done():
@@ -1018,9 +1051,11 @@ async def main() -> int:
         page.on("response", on_response)
 
         try:
-            await page.goto(args.url, wait_until="domcontentloaded", timeout=45_000)
-        except PlaywrightTimeoutError:
-            print("Page load timed out, but network capture is still active...", file=sys.stderr)
+            await navigate_initial_page(page, args.url, args.discover_episode_urls)
+        except RuntimeError as exc:
+            await context.close()
+            print(f"Discovery navigation failed: {exc}", file=sys.stderr)
+            return 4
 
         if (
             args.top_right_click_delay is not None

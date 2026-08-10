@@ -428,6 +428,32 @@ class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(selected, created)
         context.new_page.assert_awaited_once_with()
 
+    async def test_initial_discovery_diversion_is_retried_once(self):
+        target = "https://media.example/anime/1735?episode=23"
+        page = mock.Mock(url="about:blank")
+        attempts = 0
+
+        async def navigate(*args, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            page.url = "about:blank" if attempts == 1 else target
+
+        page.goto = mock.AsyncMock(side_effect=navigate)
+
+        await capture.navigate_initial_page(page, target, discovery=True)
+
+        self.assertEqual(page.goto.await_count, 2)
+
+    async def test_repeated_initial_discovery_diversion_fails_closed(self):
+        target = "https://media.example/anime/1735?episode=23"
+        page = mock.Mock(url="about:blank")
+        page.goto = mock.AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "repeatedly diverted"):
+            await capture.navigate_initial_page(page, target, discovery=True)
+
+        self.assertEqual(page.goto.await_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
