@@ -210,6 +210,53 @@ class AutomaticExpansionTests(unittest.TestCase):
 
 
 class EpisodeExtractionTests(unittest.TestCase):
+    def test_extracts_structured_playlist_candidates_and_deduplicates_urls(self):
+        prefix = downloader.CAPTURED_PLAYLIST_PREFIX
+        first = {
+            "url": "https://cdn.example/decoy.m3u8",
+            "method": "GET",
+            "headers": {
+                "referer": "https://media.example/",
+                "host": "cdn.example",
+            },
+            "post_data": None,
+        }
+        second = {
+            "url": "https://cdn.example/usable.m3u8",
+            "method": "GET",
+            "headers": {"user-agent": "Browser"},
+            "post_data": None,
+        }
+        text = "\n".join(
+            [
+                prefix + downloader.json.dumps(first),
+                prefix + downloader.json.dumps(first),
+                prefix + downloader.json.dumps(second),
+                "curl https://legacy.example/master.m3u8",
+            ]
+        )
+
+        self.assertEqual(
+            downloader.extract_captured_playlists(text),
+            [
+                (first["url"], ["referer: https://media.example/"]),
+                (second["url"], ["user-agent: Browser"]),
+            ],
+        )
+
+    def test_legacy_single_curl_capture_remains_supported(self):
+        self.assertEqual(
+            downloader.extract_captured_playlists(
+                "curl 'https://cdn.example/master.m3u8' -H 'referer: https://media.example/'"
+            ),
+            [
+                (
+                    "https://cdn.example/master.m3u8",
+                    ["referer: https://media.example/"],
+                )
+            ],
+        )
+
     def test_extracts_absolute_relative_encoded_and_fragment_urls(self):
         base = "https://media.example/shows/title#S1-E1-100"
         values = [
@@ -561,6 +608,29 @@ class BrowserLaunchTests(unittest.TestCase):
 
 
 class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_collector_keeps_later_unique_playlist_after_first_result(self):
+        found = asyncio.get_running_loop().create_future()
+        found.set_result(("https://cdn.example/first.m3u8", "GET", {}, None))
+        captured = []
+        seen = {"https://cdn.example/first.m3u8"}
+        request = mock.Mock(
+            url="https://cdn.example/second.m3u8",
+            method="GET",
+            post_data=None,
+        )
+        request.all_headers = mock.AsyncMock(return_value={"referer": "https://media.example/"})
+
+        recorded = await capture.capture_request_if_matching(
+            request,
+            found,
+            ".m3u8",
+            captured,
+            seen,
+        )
+
+        self.assertTrue(recorded)
+        self.assertEqual([candidate[0] for candidate in captured], [request.url])
+
     async def test_matching_request_rechecks_future_after_headers(self):
         found = asyncio.get_running_loop().create_future()
         winner = ("https://cdn.example/first.m3u8", "GET", {}, None)
@@ -725,6 +795,103 @@ class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
             timeout=10_000,
         )
         page.goto.assert_not_awaited()
+
+
+class PlaylistCandidateValidationTests(unittest.TestCase):
+    @mock.patch.object(downloader.subprocess, "run")
+    def test_probe_rejects_png_only_candidate(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=downloader.json.dumps(
+                {
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "codec_name": "png",
+                            "width": 0,
+                            "height": 0,
+                        }
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+        usable, detail = downloader.probe_playlist_candidate(
+            "ffprobe",
+            "https://cdn.example/decoy.m3u8",
+            [],
+            5,
+        )
+
+        self.assertFalse(usable)
+        self.assertIn("png", detail)
+
+    @mock.patch.object(downloader.subprocess, "run")
+    def test_probe_accepts_dimensioned_standard_video(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout=downloader.json.dumps(
+                {
+                    "streams": [
+                        {
+                            "codec_type": "video",
+                            "codec_name": "h264",
+                            "width": 1920,
+                            "height": 1080,
+                        },
+                        {"codec_type": "audio", "codec_name": "aac"},
+                    ]
+                }
+            ),
+            stderr="",
+        )
+
+        usable, detail = downloader.probe_playlist_candidate(
+            "ffprobe",
+            "https://cdn.example/usable.m3u8",
+            ["referer: https://media.example/"],
+            5,
+        )
+
+        self.assertTrue(usable)
+        self.assertIn("h264 1920x1080", detail)
+        command = run.call_args.args[0]
+        self.assertLess(command.index("-headers"), command.index("https://cdn.example/usable.m3u8"))
+
+    def test_selector_skips_rejected_candidate_and_uses_next(self):
+        candidates = [
+            ("https://cdn.example/decoy.m3u8", []),
+            ("https://cdn.example/usable.m3u8", ["referer: https://media.example/"]),
+        ]
+        with (
+            mock.patch.object(downloader, "ffprobe_for_ffmpeg", return_value="ffprobe"),
+            mock.patch.object(
+                downloader,
+                "probe_playlist_candidate",
+                side_effect=[
+                    (False, "no usable video stream (detected: png)"),
+                    (True, "h264 1280x720, audio streams: 1"),
+                ],
+            ) as probe,
+        ):
+            selected = downloader.select_playlist_candidate("ffmpeg", candidates, 5)
+
+        self.assertEqual(selected, candidates[1])
+        self.assertEqual(probe.call_count, 2)
+
+    def test_selector_fails_clearly_when_every_candidate_is_rejected(self):
+        candidates = [("https://cdn.example/decoy.m3u8", [])]
+        with (
+            mock.patch.object(downloader, "ffprobe_for_ffmpeg", return_value="ffprobe"),
+            mock.patch.object(
+                downloader,
+                "probe_playlist_candidate",
+                return_value=(False, "no usable video stream (detected: png)"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no captured playlist exposed"):
+                downloader.select_playlist_candidate("ffmpeg", candidates, 5)
 
 
 if __name__ == "__main__":

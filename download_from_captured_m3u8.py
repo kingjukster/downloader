@@ -30,6 +30,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 DEFAULT_CAPTURE_SCRIPT = Path(__file__).resolve().with_name("capture_m3u8_curl.py")
 DEFAULT_PLAYLIST_MATCH = ".m3u8"
+CAPTURED_PLAYLIST_PREFIX = "CAPTURED_PLAYLIST_JSON "
+REPLAY_UNSAFE_HEADERS = {"accept-encoding", "connection", "content-length", "host"}
 DEFAULT_OPERA_AIR = Path.home() / r"AppData\Local\Programs\Opera Air\opera.exe"
 DEFAULT_OPERA_AIR_PROFILE = Path.home() / r"AppData\Roaming\Opera Software\Opera Air Stable"
 DEFAULT_CAPTURE_PROFILE = Path(__file__).resolve().parent / "work" / "opera-air-capture-profile"
@@ -81,6 +83,43 @@ def parse_curl_command(curl_text: str) -> tuple[str, list[str]]:
         raise ValueError("could not find an m3u8 URL in the captured curl command")
 
     return m3u8_url, headers
+
+
+def extract_captured_playlists(text: str) -> list[tuple[str, list[str]]]:
+    """Parse structured multi-playlist output, with legacy curl fallback."""
+    candidates: list[tuple[str, list[str]]] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        if not line.startswith(CAPTURED_PLAYLIST_PREFIX):
+            continue
+        try:
+            record = json.loads(line[len(CAPTURED_PLAYLIST_PREFIX) :])
+        except json.JSONDecodeError:
+            continue
+        url = str(record.get("url") or "").strip()
+        headers = record.get("headers")
+        if not url.startswith(("http://", "https://")) or not isinstance(headers, dict):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        candidates.append(
+            (
+                url,
+                [
+                    f"{name}: {value}"
+                    for name, value in headers.items()
+                    if name
+                    and value
+                    and name.casefold() not in REPLAY_UNSAFE_HEADERS
+                    and not name.startswith(":")
+                ],
+            )
+        )
+    if candidates:
+        return candidates
+    curl_text = extract_curl_command(text)
+    return [parse_curl_command(curl_text)]
 
 
 def safe_filename_part(value: str) -> str:
@@ -221,6 +260,10 @@ def run_capture(args: argparse.Namespace) -> str:
         cmd.append("--visible")
     if args.contains:
         cmd.extend(["--contains", args.contains])
+    if args.playlist_collection_wait > 0:
+        cmd.extend(
+            ["--collect-playlists-seconds", str(args.playlist_collection_wait)]
+        )
     if args.user_data_dir:
         cmd.extend(["--user-data-dir", str(args.user_data_dir)])
     if args.browser_executable:
@@ -365,6 +408,114 @@ def run_ffmpeg(
     print("Downloading to:", output, file=sys.stderr)
     print("Running ffmpeg:", " ".join(shlex.quote(p) for p in cmd), file=sys.stderr)
     return subprocess.call(cmd)
+
+
+def ffprobe_for_ffmpeg(ffmpeg: str) -> str | None:
+    """Locate ffprobe beside ffmpeg first, then fall back to PATH."""
+    sibling_name = "ffprobe.exe" if Path(ffmpeg).suffix.casefold() == ".exe" else "ffprobe"
+    sibling = Path(ffmpeg).resolve().with_name(sibling_name)
+    if sibling.is_file():
+        return str(sibling)
+    return shutil.which("ffprobe")
+
+
+def probe_playlist_candidate(
+    ffprobe: str,
+    m3u8_url: str,
+    headers: list[str],
+    timeout: float,
+) -> tuple[bool, str]:
+    """Accept only candidates exposing a normal, dimensioned video stream."""
+    header_blob = "".join(f"{header}\r\n" for header in headers)
+    cmd = [ffprobe, "-v", "error"]
+    if header_blob:
+        cmd.extend(["-headers", header_blob])
+    cmd.extend(
+        [
+            "-allowed_segment_extensions",
+            "ALL",
+            "-extension_picky",
+            "0",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            m3u8_url,
+        ]
+    )
+    try:
+        result = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            timeout=max(timeout, 1),
+        )
+    except subprocess.TimeoutExpired:
+        return False, "probe timed out"
+    if result.returncode != 0:
+        detail = next((line.strip() for line in result.stderr.splitlines() if line.strip()), "probe failed")
+        return False, detail
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False, "probe returned invalid JSON"
+    streams = payload.get("streams")
+    if not isinstance(streams, list):
+        return False, "probe returned no streams"
+    video_streams = [stream for stream in streams if stream.get("codec_type") == "video"]
+    if not video_streams:
+        return False, "no video stream"
+    def positive_dimension(value: object) -> bool:
+        try:
+            return int(value or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    usable_video = [
+        stream
+        for stream in video_streams
+        if str(stream.get("codec_name") or "").casefold() not in ("", "png")
+        and positive_dimension(stream.get("width"))
+        and positive_dimension(stream.get("height"))
+    ]
+    if not usable_video:
+        codecs = ", ".join(
+            sorted({str(stream.get("codec_name") or "unknown") for stream in video_streams})
+        )
+        return False, f"no usable video stream (detected: {codecs})"
+    chosen = usable_video[0]
+    audio_count = sum(stream.get("codec_type") == "audio" for stream in streams)
+    return (
+        True,
+        f"{chosen.get('codec_name')} {chosen.get('width')}x{chosen.get('height')}, "
+        f"audio streams: {audio_count}",
+    )
+
+
+def select_playlist_candidate(
+    ffmpeg: str,
+    candidates: list[tuple[str, list[str]]],
+    probe_timeout: float,
+) -> tuple[str, list[str]]:
+    """Return the first ffprobe-validated candidate or explain all rejections."""
+    if not candidates:
+        raise ValueError("capture returned no playlist candidates")
+    ffprobe = ffprobe_for_ffmpeg(ffmpeg)
+    if not ffprobe:
+        print("ffprobe was not found; using the first captured playlist.", file=sys.stderr)
+        return candidates[0]
+    rejections: list[str] = []
+    for index, (url, headers) in enumerate(candidates, start=1):
+        print(f"Probing playlist candidate {index}/{len(candidates)}: {url}", file=sys.stderr)
+        usable, detail = probe_playlist_candidate(ffprobe, url, headers, probe_timeout)
+        if usable:
+            print(f"Selected playlist candidate {index}: {detail}", file=sys.stderr)
+            return url, headers
+        print(f"Rejected playlist candidate {index}: {detail}", file=sys.stderr)
+        rejections.append(f"candidate {index}: {detail}")
+    raise RuntimeError(
+        "no captured playlist exposed a standard video stream; " + "; ".join(rejections)
+    )
 
 
 def load_url_file(path: Path) -> list[str]:
@@ -546,8 +697,13 @@ def download_one(args: argparse.Namespace, ffmpeg: str, url: str, output: Path, 
     args.current_url = url
     print(f"\n[{index}/{total}] Processing: {url}", file=sys.stderr)
     captured_stdout = run_capture(args)
-    curl_text = extract_curl_command(captured_stdout)
-    m3u8_url, headers = parse_curl_command(curl_text)
+    candidates = extract_captured_playlists(captured_stdout)
+    print(f"Captured {len(candidates)} playlist candidate(s).", file=sys.stderr)
+    m3u8_url, headers = select_playlist_candidate(
+        ffmpeg,
+        candidates,
+        args.playlist_probe_timeout,
+    )
     print("Captured m3u8:", m3u8_url, file=sys.stderr)
     return run_ffmpeg(ffmpeg, m3u8_url, headers, output, args.duration, args.overwrite)
 
@@ -681,6 +837,18 @@ def main() -> int:
         type=float,
         default=60,
         help="Seconds to wait for an m3u8 request. Default: 60.",
+    )
+    parser.add_argument(
+        "--playlist-collection-wait",
+        type=float,
+        default=5,
+        help="Seconds to collect additional HLS candidates after the first. Default: 5.",
+    )
+    parser.add_argument(
+        "--playlist-probe-timeout",
+        type=float,
+        default=20,
+        help="Maximum ffprobe seconds per captured playlist candidate. Default: 20.",
     )
     parser.add_argument(
         "--contains",

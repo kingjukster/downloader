@@ -46,6 +46,15 @@ The browser may still require a manual login, consent click, or playback action.
 The existing `--url-file`, catalog, and explicit series-expansion modes remain
 available for batch workflows.
 
+During capture, the downloader keeps listening briefly after the first HLS
+playlist, then checks every unique candidate with `ffprobe`. PNG-only,
+streamless, and otherwise non-video candidates are rejected before FFmpeg runs;
+the first normal dimensioned video rendition is selected. Use
+`--playlist-collection-wait 15` when you need extra time to choose an alternate
+player/server manually, and `--playlist-probe-timeout N` to change the per-
+candidate validation limit. If all candidates are transformed rather than
+standard HLS media, the downloader stops with a consolidated rejection message.
+
 New downloads use media-library-friendly names such as `Movie Title (2026).mp4`
 and `S01E02 - Show Title (2026).mp4`.
 

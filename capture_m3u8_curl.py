@@ -32,10 +32,22 @@ NOISY_HEADERS = {
     "host",
 }
 DEFAULT_PLAYLIST_MATCH = ".m3u8"
+CAPTURED_PLAYLIST_PREFIX = "CAPTURED_PLAYLIST_JSON "
 
 
 def bash_quote(value: str) -> str:
     return shlex.quote(value)
+
+
+def filtered_request_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Keep replay-safe request headers for curl, ffprobe, and ffmpeg."""
+    return {
+        name: value
+        for name, value in headers.items()
+        if name.casefold() not in NOISY_HEADERS
+        and not name.startswith(":")
+        and value != ""
+    }
 
 
 def request_url_matches_playlist(url: str, match_text: str) -> bool:
@@ -50,17 +62,29 @@ async def capture_request_if_matching(
     request: Any,
     found: asyncio.Future[tuple[str, str, dict[str, str], str | None]],
     match_text: str,
+    captured: list[tuple[str, str, dict[str, str], str | None]] | None = None,
+    seen_urls: set[str] | None = None,
 ) -> bool:
     """Resolve the first matching request without racing concurrent callbacks."""
-    if found.done() or not request_url_matches_playlist(request.url, match_text):
+    if not request_url_matches_playlist(request.url, match_text):
+        return False
+    if found.done() and captured is None:
         return False
     headers = await request.all_headers()
+    candidate = (request.url, request.method, headers, request.post_data)
+    recorded = False
+    if captured is not None:
+        if seen_urls is None or request.url not in seen_urls:
+            if seen_urls is not None:
+                seen_urls.add(request.url)
+            captured.append(candidate)
+            recorded = True
     if found.done():
-        return False
+        return recorded
     try:
-        found.set_result((request.url, request.method, headers, request.post_data))
+        found.set_result(candidate)
     except asyncio.InvalidStateError:
-        return False
+        return recorded
     return True
 
 
@@ -70,14 +94,10 @@ def curl_from_request(url: str, method: str, headers: dict[str, str], post_data:
     if method.upper() != "GET":
         lines.append(f"-X {bash_quote(method.upper())}")
 
-    for name, value in sorted(headers.items(), key=lambda item: item[0].lower()):
-        lower = name.lower()
-        if lower in NOISY_HEADERS:
-            continue
-        if lower.startswith(":"):
-            continue
-        if value == "":
-            continue
+    for name, value in sorted(
+        filtered_request_headers(headers).items(),
+        key=lambda item: item[0].lower(),
+    ):
         lines.append(f"-H {bash_quote(f'{name}: {value}')}")
 
     if post_data:
@@ -991,6 +1011,12 @@ async def main() -> int:
         help="Seconds to wait for a matching request. Default: 60.",
     )
     parser.add_argument(
+        "--collect-playlists-seconds",
+        type=float,
+        default=0,
+        help="After the first playlist, collect additional candidates for this many seconds.",
+    )
+    parser.add_argument(
         "--visible",
         action="store_true",
         help="Show the browser window so you can click play/login/consent prompts.",
@@ -1067,6 +1093,8 @@ async def main() -> int:
 
     match_text = args.contains.lower()
     found: asyncio.Future[tuple[str, str, dict[str, str], str | None]] = asyncio.Future()
+    captured_playlists: list[tuple[str, str, dict[str, str], str | None]] = []
+    seen_playlist_urls: set[str] = set()
     discovery_values: list[str] = []
 
     async with async_playwright() as playwright:
@@ -1081,7 +1109,13 @@ async def main() -> int:
         pages_before_navigation = list(context.pages)
 
         async def on_request(request):
-            await capture_request_if_matching(request, found, match_text)
+            await capture_request_if_matching(
+                request,
+                found,
+                match_text,
+                captured_playlists,
+                seen_playlist_urls,
+            )
 
         async def on_response(response):
             if not args.discover_episode_urls:
@@ -1200,6 +1234,30 @@ async def main() -> int:
                 file=sys.stderr,
             )
             return 2
+
+        if args.collect_playlists_seconds > 0:
+            await settle_guarded_click(
+                page,
+                pages_before_navigation,
+                args.url,
+                args.collect_playlists_seconds,
+            )
+
+        if not captured_playlists:
+            captured_playlists.append((url, method, headers, post_data))
+        for candidate_url, candidate_method, candidate_headers, candidate_post_data in captured_playlists:
+            print(
+                CAPTURED_PLAYLIST_PREFIX
+                + json.dumps(
+                    {
+                        "url": candidate_url,
+                        "method": candidate_method,
+                        "headers": filtered_request_headers(candidate_headers),
+                        "post_data": candidate_post_data,
+                    },
+                    separators=(",", ":"),
+                )
+            )
 
         curl = curl_from_request(url, method, headers, post_data)
         print(curl)
