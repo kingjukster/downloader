@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+# Runtime artifacts stay outside development history.
+downloads/
+work/
+*.mp4
+*.part
+*.log

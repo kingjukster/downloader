@@ -633,15 +633,16 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "During discovery, drive visible Season/Episode dropdowns and record resulting URLs. "
-            "Enabled by default in automatic one-link mode."
+            "During discovery, traverse paginated All Episodes grids or drive visible "
+            "Season/Episode dropdowns and record resulting URLs. Enabled by default in "
+            "automatic one-link mode."
         ),
     )
     parser.add_argument(
         "--dropdown-wait",
         type=float,
         default=0.75,
-        help="Seconds to wait after each dropdown episode click. Default: 0.75.",
+        help="Seconds to wait after each interactive episode click. Default: 0.75.",
     )
     parser.add_argument(
         "--capture-script",

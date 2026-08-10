@@ -182,6 +182,48 @@ def extract_episode_urls_from_season_data(values: list[str], base_url: str) -> l
     return urls
 
 
+def parse_episode_grid_summary(text: str) -> tuple[int, int, int | None] | None:
+    """Parse pagination text such as ``Page 1 of 5 • 500 total``."""
+    match = re.search(
+        r"\bPage\s+(\d+)\s+of\s+(\d+)"
+        r"(?:\s*(?:[•·|\-]\s*)?(\d+)\s+total)?\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    current_page = int(match.group(1))
+    total_pages = int(match.group(2))
+    total_items = int(match.group(3)) if match.group(3) else None
+    if current_page < 1 or total_pages < current_page:
+        return None
+    return current_page, total_pages, total_items
+
+
+def episode_numbers_in_urls(urls: list[str]) -> set[int]:
+    """Return episode numbers represented by the downloader's S/E fragments."""
+    numbers: set[int] = set()
+    for url in urls:
+        match = re.search(r"[#&]S\d+-E(\d+)(?:-|$)", unquote(url), re.IGNORECASE)
+        if match:
+            numbers.add(int(match.group(1)))
+    return numbers
+
+
+def largest_contiguous_number_run(numbers: list[int]) -> list[int]:
+    """Separate a numeric episode grid from small pagination counters."""
+    ordered = sorted(set(numbers))
+    if not ordered:
+        return []
+    runs: list[list[int]] = [[ordered[0]]]
+    for number in ordered[1:]:
+        if number == runs[-1][-1] + 1:
+            runs[-1].append(number)
+        else:
+            runs.append([number])
+    return max(runs, key=lambda run: (len(run), run[-1]))
+
+
 async def auto_scroll_page(page: Any) -> None:
     try:
         await page.evaluate(
@@ -280,6 +322,231 @@ async def click_visible_text(page: Any, text: str, mode: str = "last", timeout: 
             return True
         await page.wait_for_timeout(150)
     return False
+
+
+async def episode_grid_state(page: Any) -> dict[str, Any] | None:
+    """Inspect a visible All Episodes grid without depending on site CSS names."""
+    raw_state = await page.evaluate(
+        r"""
+        () => {
+          const visible = element => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none' &&
+              Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+          };
+          const textOf = element => (element.innerText || element.textContent || '')
+            .replace(/\s+/g, ' ').trim();
+          const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'));
+          const heading = headings.find(element => /^All Episodes$/i.test(textOf(element)) && visible(element));
+          if (!heading) return null;
+
+          const pagePattern = /\bPage\s+\d+\s+of\s+\d+/i;
+          let root = heading.parentElement;
+          while (root) {
+            const rootText = textOf(root);
+            const numericCount = Array.from(root.querySelectorAll('*')).filter(element =>
+              /^\d+$/.test(textOf(element)) && visible(element)
+            ).length;
+            if (pagePattern.test(rootText) && numericCount >= 2) break;
+            if (root === document.body) {
+              root = null;
+              break;
+            }
+            root = root.parentElement;
+          }
+          if (!root) return null;
+
+          const numbers = Array.from(root.querySelectorAll('*'))
+            .filter(element => /^\d+$/.test(textOf(element)) && visible(element))
+            .map(element => Number(textOf(element)))
+            .filter(number => Number.isSafeInteger(number) && number > 0);
+          return {
+            summary: textOf(root),
+            episode_numbers: Array.from(new Set(numbers)).sort((a, b) => a - b),
+          };
+        }
+        """
+    )
+    if not isinstance(raw_state, dict):
+        return None
+    summary = str(raw_state.get("summary") or "")
+    parsed = parse_episode_grid_summary(summary)
+    if not parsed:
+        return None
+    current_page, total_pages, total_items = parsed
+    episode_numbers = largest_contiguous_number_run(
+        [
+            int(number)
+            for number in raw_state.get("episode_numbers", [])
+            if str(number).isdigit()
+            and int(number) > 0
+            and (total_items is None or int(number) <= total_items)
+        ]
+    )
+    if not episode_numbers:
+        return None
+    return {
+        "current_page": current_page,
+        "total_pages": total_pages,
+        "total_items": total_items,
+        "episode_numbers": episode_numbers,
+    }
+
+
+async def click_episode_grid_control(page: Any, label: str | int) -> bool:
+    """Click a numeric episode, PREV, or NEXT inside the All Episodes region."""
+    return bool(
+        await page.evaluate(
+            r"""
+            ({ label }) => {
+              const visible = element => {
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.visibility !== 'hidden' && style.display !== 'none' &&
+                  Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0;
+              };
+              const textOf = element => (element.innerText || element.textContent || '')
+                .replace(/\s+/g, ' ').trim();
+              const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,[role="heading"]'));
+              const heading = headings.find(element => /^All Episodes$/i.test(textOf(element)) && visible(element));
+              if (!heading) return false;
+
+              const pagePattern = /\bPage\s+\d+\s+of\s+\d+/i;
+              let root = heading.parentElement;
+              while (root) {
+                if (pagePattern.test(textOf(root))) break;
+                if (root === document.body) {
+                  root = null;
+                  break;
+                }
+                root = root.parentElement;
+              }
+              if (!root) return false;
+
+              const wanted = String(label).trim().toUpperCase();
+              const candidates = Array.from(root.querySelectorAll('*')).filter(element => {
+                if (!visible(element)) return false;
+                const text = textOf(element).toUpperCase();
+                if (/^\d+$/.test(wanted)) return text === wanted;
+                return text === wanted || text.startsWith(`${wanted} `);
+              });
+              if (!candidates.length) return false;
+              const semantic = candidates.filter(element => element.matches(
+                'a[href],button,[role="button"],[onclick],[data-href],[data-url],[data-link]'
+              ));
+              const clickable = semantic.length ? semantic : candidates;
+              clickable.sort((a, b) => {
+                const aRect = a.getBoundingClientRect();
+                const bRect = b.getBoundingClientRect();
+                return (bRect.width * bRect.height) - (aRect.width * aRect.height);
+              });
+              clickable[0].click();
+              return true;
+            }
+            """,
+            {"label": str(label)},
+        )
+    )
+
+
+async def wait_for_episode_grid_page(page: Any, expected_page: int, timeout: int = 5000) -> bool:
+    deadline = asyncio.get_running_loop().time() + (timeout / 1000)
+    while asyncio.get_running_loop().time() < deadline:
+        await page.wait_for_timeout(150)
+        state = await episode_grid_state(page)
+        if state and state["current_page"] == expected_page:
+            return True
+    return False
+
+
+async def discover_episode_urls_from_paginated_grid(
+    page: Any,
+    base_url: str,
+    captured_values: list[str],
+    per_click_wait: float,
+) -> tuple[bool, list[str]]:
+    """Traverse a flat All Episodes grid, using direct URLs before clicks."""
+    state = await episode_grid_state(page)
+    if not state:
+        return False, []
+
+    print(
+        f"Found paginated All Episodes grid: page {state['current_page']} "
+        f"of {state['total_pages']}.",
+        file=sys.stderr,
+    )
+    while state["current_page"] > 1:
+        expected_page = state["current_page"] - 1
+        if not await click_episode_grid_control(page, "PREV"):
+            print("Could not return the episode grid to page 1.", file=sys.stderr)
+            break
+        if not await wait_for_episode_grid_page(page, expected_page):
+            print("Episode-grid PREV navigation stalled.", file=sys.stderr)
+            break
+        state = await episode_grid_state(page) or state
+
+    discovered: list[str] = []
+    seen: set[str] = set()
+    captured_cursor = 0
+    visited_pages: set[int] = set()
+    total_pages = min(int(state["total_pages"]), 1000)
+    total_items = state.get("total_items")
+
+    def merge(values: list[str]) -> None:
+        for url in extract_episode_urls_from_values(values, base_url):
+            if url not in seen:
+                seen.add(url)
+                discovered.append(url)
+
+    while state and len(visited_pages) < total_pages:
+        current_page = int(state["current_page"])
+        if current_page in visited_pages:
+            break
+        visited_pages.add(current_page)
+        print(
+            f"Scanning episode grid page {current_page}/{state['total_pages']}...",
+            file=sys.stderr,
+        )
+
+        page_values = [page.url, *captured_values[captured_cursor:], *await collect_page_values(page)]
+        captured_cursor = len(captured_values)
+        merge(page_values)
+        represented = episode_numbers_in_urls(discovered)
+        missing_numbers = [
+            number for number in state["episode_numbers"] if number not in represented
+        ]
+
+        for episode_number in missing_numbers:
+            if not await click_episode_grid_control(page, episode_number):
+                print(f"Could not click episode {episode_number}; continuing.", file=sys.stderr)
+                continue
+            if per_click_wait > 0:
+                await page.wait_for_timeout(per_click_wait * 1000)
+            click_values = [page.url, *captured_values[captured_cursor:]]
+            captured_cursor = len(captured_values)
+            merge(click_values)
+            if episode_number not in episode_numbers_in_urls(discovered):
+                merge(await collect_page_values(page))
+
+        if current_page >= state["total_pages"]:
+            break
+        expected_page = current_page + 1
+        if not await click_episode_grid_control(page, "NEXT"):
+            print("Episode-grid NEXT control was not clickable.", file=sys.stderr)
+            break
+        if not await wait_for_episode_grid_page(page, expected_page):
+            print("Episode-grid NEXT navigation stalled.", file=sys.stderr)
+            break
+        state = await episode_grid_state(page)
+
+    if total_items and len(discovered) < int(total_items):
+        print(
+            f"Episode grid advertised {total_items} total, but {len(discovered)} "
+            "downloadable episode URL(s) were resolved.",
+            file=sys.stderr,
+        )
+    return True, discovered
 
 
 async def select_dropdown_value(page: Any, current_label: str, target_label: str, kind: str) -> str:
@@ -532,7 +799,10 @@ async def main() -> int:
     parser.add_argument(
         "--discover-dropdowns",
         action="store_true",
-        help="During discovery, drive visible Season/Episode dropdowns and record resulting URLs.",
+        help=(
+            "During discovery, traverse a paginated All Episodes grid or drive visible "
+            "Season/Episode dropdowns and record resulting URLs."
+        ),
     )
     parser.add_argument(
         "--episode-counts",
@@ -542,7 +812,7 @@ async def main() -> int:
         "--dropdown-wait",
         type=float,
         default=0.75,
-        help="Seconds to wait after each dropdown episode click. Default: 0.75.",
+        help="Seconds to wait after each interactive episode click. Default: 0.75.",
     )
     parser.add_argument(
         "--output",
@@ -621,24 +891,38 @@ async def main() -> int:
             if structured_urls:
                 print(
                     f"Found {len(structured_urls)} episode URL(s) in structured season data; "
-                    "skipping dropdown traversal.",
+                    "skipping interactive traversal.",
                     file=sys.stderr,
                 )
             elif args.discover_dropdowns:
                 try:
-                    dropdown_urls = await discover_episode_urls_from_dropdowns(
-                        page,
-                        args.url,
-                        parse_episode_counts(args.episode_counts),
-                        args.dropdown_wait,
+                    grid_detected, grid_urls = await discover_episode_urls_from_paginated_grid(
+                        page, args.url, discovery_values, args.dropdown_wait
                     )
                     seen = set(urls)
-                    for dropdown_url in dropdown_urls:
-                        if dropdown_url not in seen:
-                            seen.add(dropdown_url)
-                            urls.append(dropdown_url)
+                    for grid_url in grid_urls:
+                        if grid_url not in seen:
+                            seen.add(grid_url)
+                            urls.append(grid_url)
+                    if grid_detected:
+                        print(
+                            f"Resolved {len(grid_urls)} episode URL(s) from the paginated grid; "
+                            "skipping dropdown traversal.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        dropdown_urls = await discover_episode_urls_from_dropdowns(
+                            page,
+                            args.url,
+                            parse_episode_counts(args.episode_counts),
+                            args.dropdown_wait,
+                        )
+                        for dropdown_url in dropdown_urls:
+                            if dropdown_url not in seen:
+                                seen.add(dropdown_url)
+                                urls.append(dropdown_url)
                 except Exception as exc:
-                    print(f"Dropdown discovery failed: {exc}", file=sys.stderr)
+                    print(f"Interactive episode discovery failed: {exc}", file=sys.stderr)
             print(f"Discovered {len(urls)} episode URL(s).", file=sys.stderr)
             for url in urls:
                 print(url)

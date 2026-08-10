@@ -11,11 +11,14 @@ python .\download_from_captured_m3u8.py "https://example.com/title"
 ```
 
 The command opens the link in the dedicated Opera Air capture profile. It first
-looks for episode links and drives visible Season/Episode controls. If episodes
-are found, it deduplicates them, sorts them by season and episode, and processes
-the full queue. If none are found, it treats the link as a movie or other single
-title and captures that page directly. Downloader-owned browser tabs are muted;
-this does not mute a normal Opera session. Downloads default to `downloads`.
+looks for episode links, traverses flat paginated `All Episodes` grids, and falls
+back to visible Season/Episode controls. For large grids, it scans each page for
+direct links first and clicks only episodes whose URLs remain hidden behind
+JavaScript. If episodes are found, it deduplicates them, sorts them by season and
+episode, and processes the full queue. If none are found, it treats the link as a
+movie or other single title and captures that page directly. Downloader-owned
+browser tabs are muted; this does not mute a normal Opera session. Downloads
+default to `downloads`.
 
 To inspect the resolved queue without downloading:
 
@@ -27,7 +30,7 @@ Useful overrides:
 
 - `--no-auto-expand` skips title detection and processes the supplied link only.
 - `--no-discover-dropdowns` performs passive episode discovery without changing
-  season or episode controls.
+  paginated episode grids or season/episode controls.
 - `--episode-counts 6,13,16` supplies known per-season counts when a site's
   custom controls do not expose every option at once.
 - `--parallel N` processes multiple discovered episodes concurrently. The

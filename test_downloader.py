@@ -189,6 +189,123 @@ class EpisodeExtractionTests(unittest.TestCase):
             ],
         )
 
+    def test_parses_paginated_all_episodes_summary(self):
+        self.assertEqual(
+            capture.parse_episode_grid_summary("All Episodes Page 1 of 5 • 500 total"),
+            (1, 5, 500),
+        )
+        self.assertEqual(
+            capture.parse_episode_grid_summary("PAGE 3 OF 8"),
+            (3, 8, None),
+        )
+        self.assertIsNone(capture.parse_episode_grid_summary("Season 1 Episode 5"))
+
+    def test_finds_episode_numbers_already_resolved_from_grid(self):
+        self.assertEqual(
+            capture.episode_numbers_in_urls(
+                [
+                    "https://media.example/show#S1-E1-101",
+                    "https://media.example/show#S1-E100-200",
+                    "https://media.example/movie",
+                ]
+            ),
+            {1, 100},
+        )
+
+    def test_episode_grid_ignores_separate_pagination_counters(self):
+        self.assertEqual(
+            capture.largest_contiguous_number_run([2, 5, *range(101, 201)]),
+            list(range(101, 201)),
+        )
+
+
+class PaginatedEpisodeGridTests(unittest.IsolatedAsyncioTestCase):
+    async def test_scans_pages_and_clicks_only_unresolved_episode_numbers(self):
+        page = mock.Mock(url="https://media.example/show")
+        page.wait_for_timeout = mock.AsyncMock()
+        states = [
+            {
+                "current_page": 1,
+                "total_pages": 2,
+                "total_items": 4,
+                "episode_numbers": [1, 2],
+            },
+            {
+                "current_page": 2,
+                "total_pages": 2,
+                "total_items": 4,
+                "episode_numbers": [3, 4],
+            },
+        ]
+        collected_values = [
+            ["https://media.example/show#S1-E1-101"],
+            ["https://media.example/show#S1-E2-102"],
+            [
+                "https://media.example/show#S1-E3-103",
+                "https://media.example/show#S1-E4-104",
+            ],
+        ]
+
+        with (
+            mock.patch.object(
+                capture,
+                "episode_grid_state",
+                new=mock.AsyncMock(side_effect=states),
+            ),
+            mock.patch.object(
+                capture,
+                "click_episode_grid_control",
+                new=mock.AsyncMock(return_value=True),
+            ) as click_control,
+            mock.patch.object(
+                capture,
+                "wait_for_episode_grid_page",
+                new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                capture,
+                "collect_page_values",
+                new=mock.AsyncMock(side_effect=collected_values),
+            ),
+        ):
+            detected, urls = await capture.discover_episode_urls_from_paginated_grid(
+                page,
+                "https://media.example/show",
+                [],
+                0,
+            )
+
+        self.assertTrue(detected)
+        self.assertEqual(
+            urls,
+            [
+                "https://media.example/show#S1-E1-101",
+                "https://media.example/show#S1-E2-102",
+                "https://media.example/show#S1-E3-103",
+                "https://media.example/show#S1-E4-104",
+            ],
+        )
+        self.assertEqual(
+            [call.args[1] for call in click_control.await_args_list],
+            [2, "NEXT"],
+        )
+
+    async def test_reports_when_no_episode_grid_is_present(self):
+        page = mock.Mock(url="https://media.example/movie")
+        with mock.patch.object(
+            capture,
+            "episode_grid_state",
+            new=mock.AsyncMock(return_value=None),
+        ):
+            detected, urls = await capture.discover_episode_urls_from_paginated_grid(
+                page,
+                page.url,
+                [],
+                0,
+            )
+        self.assertFalse(detected)
+        self.assertEqual(urls, [])
+
 
 class BrowserLaunchTests(unittest.TestCase):
     def test_automation_browser_is_muted(self):
