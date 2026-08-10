@@ -88,6 +88,18 @@ async def close_page_quietly(page: Any) -> None:
         pass
 
 
+async def reuse_or_create_context_page(context: Any) -> Any:
+    """Reuse Chromium's initial tab so closing it cannot expose about:blank."""
+    existing_pages = [page for page in context.pages if not page.is_closed()]
+    if not existing_pages:
+        return await context.new_page()
+
+    primary_page = existing_pages[0]
+    for extra_page in existing_pages[1:]:
+        await close_page_quietly(extra_page)
+    return primary_page
+
+
 def extract_episode_urls_from_values(values: list[str], base_url: str) -> list[str]:
     # Find the distinctive episode fragment first, then inspect only a bounded
     # prefix for its URL. The previous pair of greedy URL-prefix expressions
@@ -833,9 +845,7 @@ async def main() -> int:
             args.executable_path,
             args.extension_dir,
         )
-        for restored_page in list(context.pages):
-            await close_page_quietly(restored_page)
-        page = await context.new_page()
+        page = await reuse_or_create_context_page(context)
 
         async def on_request(request):
             if found.done():
@@ -926,7 +936,6 @@ async def main() -> int:
             print(f"Discovered {len(urls)} episode URL(s).", file=sys.stderr)
             for url in urls:
                 print(url)
-            await close_page_quietly(page)
             await context.close()
             return 0 if urls else 3
 
@@ -939,7 +948,6 @@ async def main() -> int:
         try:
             url, method, headers, post_data = await asyncio.wait_for(found, timeout=args.timeout)
         except asyncio.TimeoutError:
-            await close_page_quietly(page)
             await context.close()
             print(
                 f"No request containing {args.contains!r} was seen within {args.timeout:g}s.",
@@ -954,7 +962,6 @@ async def main() -> int:
             args.output.write_text(curl + "\n", encoding="utf-8")
             print(f"\nSaved to {args.output}", file=sys.stderr)
 
-        await close_page_quietly(page)
         await context.close()
         return 0
 

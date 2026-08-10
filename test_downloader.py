@@ -312,5 +312,34 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertIn("--mute-audio", capture.default_browser_args())
 
 
+class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reuses_initial_page_and_closes_only_extra_tabs(self):
+        primary = mock.Mock()
+        primary.is_closed.return_value = False
+        primary.close = mock.AsyncMock()
+        extra = mock.Mock()
+        extra.is_closed.return_value = False
+        extra.close = mock.AsyncMock()
+        context = mock.Mock(pages=[primary, extra])
+        context.new_page = mock.AsyncMock()
+
+        selected = await capture.reuse_or_create_context_page(context)
+
+        self.assertIs(selected, primary)
+        primary.close.assert_not_awaited()
+        extra.close.assert_awaited_once_with()
+        context.new_page.assert_not_awaited()
+
+    async def test_creates_page_when_context_has_no_open_tab(self):
+        created = mock.Mock()
+        context = mock.Mock(pages=[])
+        context.new_page = mock.AsyncMock(return_value=created)
+
+        selected = await capture.reuse_or_create_context_page(context)
+
+        self.assertIs(selected, created)
+        context.new_page.assert_awaited_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()
