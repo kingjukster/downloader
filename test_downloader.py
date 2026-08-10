@@ -276,6 +276,35 @@ class EpisodeExtractionTests(unittest.TestCase):
             {1, 100},
         )
 
+    def test_expands_numbered_episode_query_without_losing_other_parameters(self):
+        self.assertEqual(
+            capture.expand_numbered_episode_query_urls(
+                "https://media.example/anime/1735?play=true&episode=23#player",
+                3,
+            ),
+            [
+                "https://media.example/anime/1735?play=true&episode=1#player",
+                "https://media.example/anime/1735?play=true&episode=2#player",
+                "https://media.example/anime/1735?play=true&episode=3#player",
+            ],
+        )
+
+    def test_does_not_invent_query_episode_urls_without_both_proofs(self):
+        self.assertEqual(
+            capture.expand_numbered_episode_query_urls(
+                "https://media.example/anime/1735?play=true",
+                500,
+            ),
+            [],
+        )
+        self.assertEqual(
+            capture.expand_numbered_episode_query_urls(
+                "https://media.example/anime/1735?episode=23",
+                None,
+            ),
+            [],
+        )
+
     def test_episode_grid_ignores_separate_pagination_counters(self):
         self.assertEqual(
             capture.largest_contiguous_number_run([2, 5, *range(101, 201)]),
@@ -355,6 +384,41 @@ class PaginatedEpisodeGridTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(clicked)
         page.evaluate.assert_awaited_once()
+
+    async def test_query_grid_uses_advertised_total_without_clicking(self):
+        page = mock.Mock(url="https://media.example/anime/1735?play=true&episode=23")
+        page.context = mock.Mock(pages=[page])
+        state = {
+            "current_page": 1,
+            "total_pages": 5,
+            "total_items": 500,
+            "episode_numbers": list(range(1, 101)),
+        }
+
+        with (
+            mock.patch.object(
+                capture,
+                "episode_grid_state",
+                new=mock.AsyncMock(return_value=state),
+            ),
+            mock.patch.object(
+                capture,
+                "click_episode_grid_control",
+                new=mock.AsyncMock(),
+            ) as click_control,
+        ):
+            detected, urls = await capture.discover_episode_urls_from_paginated_grid(
+                page,
+                page.url,
+                [],
+                0.75,
+            )
+
+        self.assertTrue(detected)
+        self.assertEqual(len(urls), 500)
+        self.assertEqual(urls[0], "https://media.example/anime/1735?play=true&episode=1")
+        self.assertEqual(urls[-1], "https://media.example/anime/1735?play=true&episode=500")
+        click_control.assert_not_awaited()
 
     async def test_scans_pages_and_clicks_only_unresolved_episode_numbers(self):
         page = mock.Mock(url="https://media.example/show")

@@ -19,7 +19,7 @@ import shlex
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urljoin, urlparse
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -239,6 +239,25 @@ def episode_query_number(url: str) -> int | None:
             if value.isdigit() and int(value) > 0:
                 return int(value)
     return None
+
+
+def expand_numbered_episode_query_urls(url: str, total_items: int | None) -> list[str]:
+    """Build a complete flat episode queue when the URL and grid prove its shape."""
+    if total_items is None or total_items < 1 or total_items > 100_000:
+        return []
+    parsed = urlparse(url)
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(key.casefold() == "episode" for key, _ in query_pairs):
+        return []
+
+    urls: list[str] = []
+    for episode_number in range(1, total_items + 1):
+        replaced = [
+            (key, str(episode_number) if key.casefold() == "episode" else value)
+            for key, value in query_pairs
+        ]
+        urls.append(parsed._replace(query=urlencode(replaced)).geturl())
+    return urls
 
 
 def episode_numbers_in_urls(urls: list[str]) -> set[int]:
@@ -625,6 +644,15 @@ async def discover_episode_urls_from_paginated_grid(
         f"of {state['total_pages']}.",
         file=sys.stderr,
     )
+    query_urls = expand_numbered_episode_query_urls(base_url, state.get("total_items"))
+    if query_urls:
+        print(
+            f"Constructed {len(query_urls)} query-based episode URL(s) from the "
+            "advertised total; no grid clicks needed.",
+            file=sys.stderr,
+        )
+        return True, query_urls
+
     while state["current_page"] > 1:
         expected_page = state["current_page"] - 1
         pages_before_click = list(page.context.pages)
