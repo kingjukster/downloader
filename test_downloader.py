@@ -522,8 +522,57 @@ class BrowserLaunchTests(unittest.TestCase):
         self.assertEqual(capture.DEFAULT_PLAYLIST_MATCH, ".m3u8")
         self.assertEqual(downloader.DEFAULT_PLAYLIST_MATCH, ".m3u8")
 
+    def test_playlist_match_ignores_encoded_url_inside_analytics_query(self):
+        analytics_url = (
+            "https://analytics.example/ping.gif?"
+            "mu=https%3A%2F%2Fcdn.example%2Fvideo%2Fmaster.m3u8"
+        )
+        self.assertFalse(capture.request_url_matches_playlist(analytics_url, ".m3u8"))
+        self.assertTrue(
+            capture.request_url_matches_playlist(
+                "https://cdn.example/video/master.m3u8?token=abc",
+                ".m3u8",
+            )
+        )
+
 
 class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_matching_request_rechecks_future_after_headers(self):
+        found = asyncio.get_running_loop().create_future()
+        winner = ("https://cdn.example/first.m3u8", "GET", {}, None)
+        request = mock.Mock(
+            url="https://cdn.example/second.m3u8",
+            method="GET",
+            post_data=None,
+        )
+
+        async def headers():
+            found.set_result(winner)
+            return {"referer": "https://media.example/"}
+
+        request.all_headers = mock.AsyncMock(side_effect=headers)
+
+        captured = await capture.capture_request_if_matching(request, found, ".m3u8")
+
+        self.assertFalse(captured)
+        self.assertEqual(found.result(), winner)
+
+    async def test_matching_playlist_request_resolves_capture(self):
+        found = asyncio.get_running_loop().create_future()
+        request = mock.Mock(
+            url="https://cdn.example/video/master.m3u8?token=abc",
+            method="GET",
+            post_data=None,
+        )
+        request.all_headers = mock.AsyncMock(
+            return_value={"referer": "https://media.example/"}
+        )
+
+        captured = await capture.capture_request_if_matching(request, found, ".m3u8")
+
+        self.assertTrue(captured)
+        self.assertEqual(found.result()[0], request.url)
+
     async def test_reuses_initial_page_and_closes_only_extra_tabs(self):
         primary = mock.Mock()
         primary.is_closed.return_value = False

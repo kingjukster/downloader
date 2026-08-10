@@ -38,6 +38,32 @@ def bash_quote(value: str) -> str:
     return shlex.quote(value)
 
 
+def request_url_matches_playlist(url: str, match_text: str) -> bool:
+    """Match real playlist paths without accepting analytics query payloads."""
+    normalized_match = match_text.casefold()
+    if normalized_match == DEFAULT_PLAYLIST_MATCH:
+        return normalized_match in unquote(urlparse(url).path).casefold()
+    return normalized_match in url.casefold()
+
+
+async def capture_request_if_matching(
+    request: Any,
+    found: asyncio.Future[tuple[str, str, dict[str, str], str | None]],
+    match_text: str,
+) -> bool:
+    """Resolve the first matching request without racing concurrent callbacks."""
+    if found.done() or not request_url_matches_playlist(request.url, match_text):
+        return False
+    headers = await request.all_headers()
+    if found.done():
+        return False
+    try:
+        found.set_result((request.url, request.method, headers, request.post_data))
+    except asyncio.InvalidStateError:
+        return False
+    return True
+
+
 def curl_from_request(url: str, method: str, headers: dict[str, str], post_data: str | None) -> str:
     lines = [f"curl {bash_quote(url)}"]
 
@@ -1055,12 +1081,7 @@ async def main() -> int:
         pages_before_navigation = list(context.pages)
 
         async def on_request(request):
-            if found.done():
-                return
-            if match_text not in request.url.lower():
-                return
-            headers = await request.all_headers()
-            found.set_result((request.url, request.method, headers, request.post_data))
+            await capture_request_if_matching(request, found, match_text)
 
         async def on_response(response):
             if not args.discover_episode_urls:
