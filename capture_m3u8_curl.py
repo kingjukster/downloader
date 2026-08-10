@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Open a page in Chromium, watch network traffic, and print a bash curl command
-for the first request whose URL contains index.m3u8.
+for the first request whose URL contains .m3u8.
 
 Usage:
   python capture_m3u8_curl.py "https://example.com/page" --visible
@@ -31,6 +31,7 @@ NOISY_HEADERS = {
     "content-length",
     "host",
 }
+DEFAULT_PLAYLIST_MATCH = ".m3u8"
 
 
 def bash_quote(value: str) -> str:
@@ -549,7 +550,6 @@ async def settle_guarded_click(
     pages_before_click: list[Any],
     stable_url: str,
     wait_seconds: float,
-    reload_stable: bool = False,
 ) -> tuple[list[str], bool]:
     """Observe browser state without modifying site JavaScript."""
     popup_values: list[str] = []
@@ -583,14 +583,11 @@ async def settle_guarded_click(
                 file=sys.stderr,
             )
             recovered = True
-            if not reload_stable:
-                try:
-                    await page.go_back(wait_until="domcontentloaded", timeout=10_000)
-                except Exception:
-                    pass
+            try:
+                await page.go_back(wait_until="domcontentloaded", timeout=10_000)
+            except Exception:
+                pass
             if unexpected_interactive_navigation(page.url, stable_url):
-                await page.goto(stable_url, wait_until="domcontentloaded", timeout=20_000)
-            elif reload_stable:
                 await page.goto(stable_url, wait_until="domcontentloaded", timeout=20_000)
 
     if popup_values:
@@ -648,7 +645,6 @@ async def wait_for_capture_with_recovery(
                 pages_before_navigation,
                 stable_url,
                 0,
-                reload_stable=True,
             )
 
 
@@ -954,13 +950,13 @@ async def launch_browser(
 
 async def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Capture a Network-tab style curl command for index.m3u8."
+        description="Capture a Network-tab style curl command for an HLS playlist."
     )
     parser.add_argument("url", help="Page URL to open.")
     parser.add_argument(
         "--contains",
-        default="index.m3u8",
-        help='Substring to match in request URLs. Default: "index.m3u8".',
+        default=DEFAULT_PLAYLIST_MATCH,
+        help=f'Substring to match in request URLs. Default: "{DEFAULT_PLAYLIST_MATCH}".',
     )
     parser.add_argument(
         "--timeout",

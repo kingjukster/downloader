@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 
 DEFAULT_CAPTURE_SCRIPT = Path(__file__).resolve().with_name("capture_m3u8_curl.py")
+DEFAULT_PLAYLIST_MATCH = ".m3u8"
 DEFAULT_OPERA_AIR = Path.home() / r"AppData\Local\Programs\Opera Air\opera.exe"
 DEFAULT_OPERA_AIR_PROFILE = Path.home() / r"AppData\Roaming\Opera Software\Opera Air Stable"
 DEFAULT_CAPTURE_PROFILE = Path(__file__).resolve().parent / "work" / "opera-air-capture-profile"
@@ -671,8 +672,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--contains",
-        default="index.m3u8",
-        help='Request URL substring to capture. Default: "index.m3u8".',
+        default=DEFAULT_PLAYLIST_MATCH,
+        help=f'Request URL substring to capture. Default: "{DEFAULT_PLAYLIST_MATCH}".',
     )
     parser.add_argument(
         "--duration",

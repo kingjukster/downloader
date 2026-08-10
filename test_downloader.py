@@ -518,6 +518,10 @@ class BrowserLaunchTests(unittest.TestCase):
     def test_automation_browser_is_muted(self):
         self.assertIn("--mute-audio", capture.default_browser_args())
 
+    def test_capture_defaults_match_any_hls_playlist_name(self):
+        self.assertEqual(capture.DEFAULT_PLAYLIST_MATCH, ".m3u8")
+        self.assertEqual(downloader.DEFAULT_PLAYLIST_MATCH, ".m3u8")
+
 
 class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_reuses_initial_page_and_closes_only_extra_tabs(self):
@@ -622,17 +626,17 @@ class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
         popup.close.assert_awaited_once_with()
         page.evaluate.assert_not_awaited()
 
-    async def test_capture_recovery_reloads_requested_page_instead_of_using_back(self):
+    async def test_capture_recovery_uses_back_before_reload(self):
         stable = "https://media.example/anime/1735?episode=23"
         page = mock.Mock(url="about:blank")
         page.is_closed.return_value = False
         page.wait_for_timeout = mock.AsyncMock()
-        page.go_back = mock.AsyncMock()
 
-        async def navigate(url, **kwargs):
-            page.url = url
+        async def go_back(**kwargs):
+            page.url = stable
 
-        page.goto = mock.AsyncMock(side_effect=navigate)
+        page.go_back = mock.AsyncMock(side_effect=go_back)
+        page.goto = mock.AsyncMock()
         page.context = mock.Mock(pages=[page])
 
         _, recovered = await capture.settle_guarded_click(
@@ -640,16 +644,14 @@ class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [page],
             stable,
             0,
-            reload_stable=True,
         )
 
         self.assertTrue(recovered)
-        page.go_back.assert_not_awaited()
-        page.goto.assert_awaited_once_with(
-            stable,
+        page.go_back.assert_awaited_once_with(
             wait_until="domcontentloaded",
-            timeout=20_000,
+            timeout=10_000,
         )
+        page.goto.assert_not_awaited()
 
 
 if __name__ == "__main__":
