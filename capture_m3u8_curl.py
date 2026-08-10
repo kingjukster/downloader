@@ -19,7 +19,7 @@ import shlex
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, urlparse
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -462,6 +462,106 @@ async def click_episode_grid_control(page: Any, label: str | int) -> bool:
     )
 
 
+def unexpected_interactive_navigation(current_url: str, stable_url: str) -> bool:
+    """Detect blank or cross-origin navigation caused by an interactive click."""
+    if not current_url or current_url == "about:blank":
+        return True
+    current = urlparse(current_url)
+    stable = urlparse(stable_url)
+    if current.scheme not in ("http", "https"):
+        return True
+    return (current.scheme.casefold(), current.netloc.casefold()) != (
+        stable.scheme.casefold(),
+        stable.netloc.casefold(),
+    )
+
+
+async def install_discovery_popup_guard(page: Any) -> None:
+    """Block scripted pop-ups while retaining their target URLs for discovery."""
+    await page.evaluate(
+        r"""
+        () => {
+          if (window.__downloaderPopupGuardInstalled) return;
+          window.__downloaderPopupGuardInstalled = true;
+          window.__downloaderBlockedPopupUrls = [];
+          window.open = (...args) => {
+            const target = String(args[0] || '');
+            if (target) window.__downloaderBlockedPopupUrls.push(target);
+            const noop = () => undefined;
+            return new Proxy({
+              closed: false,
+              close: noop,
+              focus: noop,
+              blur: noop,
+              postMessage: noop,
+              location: { href: target },
+            }, {
+              get(object, property) {
+                return property in object ? object[property] : noop;
+              },
+            });
+          };
+        }
+        """
+    )
+
+
+async def drain_blocked_popup_urls(page: Any) -> list[str]:
+    try:
+        values = await page.evaluate(
+            r"""
+            () => {
+              const values = Array.from(window.__downloaderBlockedPopupUrls || []);
+              window.__downloaderBlockedPopupUrls = [];
+              return values;
+            }
+            """
+        )
+    except Exception:
+        return []
+    return [str(value) for value in values if value]
+
+
+async def settle_guarded_click(
+    page: Any,
+    pages_before_click: list[Any],
+    stable_url: str,
+    wait_seconds: float,
+) -> tuple[list[str], bool]:
+    """Close pop-ups and recover the primary page after an interactive click."""
+    if wait_seconds > 0:
+        await page.wait_for_timeout(wait_seconds * 1000)
+
+    popup_values = await drain_blocked_popup_urls(page)
+    context = page.context
+    for candidate in list(context.pages):
+        if candidate is page or any(candidate is existing for existing in pages_before_click):
+            continue
+        try:
+            popup_values.append(candidate.url)
+        finally:
+            await close_page_quietly(candidate)
+
+    recovered = False
+    if not page.is_closed() and unexpected_interactive_navigation(page.url, stable_url):
+        print(
+            "Interactive click diverted the primary tab; restoring the episode page.",
+            file=sys.stderr,
+        )
+        recovered = True
+        try:
+            await page.go_back(wait_until="domcontentloaded", timeout=10_000)
+        except Exception:
+            pass
+        if unexpected_interactive_navigation(page.url, stable_url):
+            await page.goto(stable_url, wait_until="domcontentloaded", timeout=20_000)
+        await install_discovery_popup_guard(page)
+
+    if popup_values:
+        print(f"Suppressed {len(popup_values)} unexpected pop-up target(s).", file=sys.stderr)
+    return popup_values, recovered
+
+
 async def wait_for_episode_grid_page(page: Any, expected_page: int, timeout: int = 5000) -> bool:
     deadline = asyncio.get_running_loop().time() + (timeout / 1000)
     while asyncio.get_running_loop().time() < deadline:
@@ -482,6 +582,7 @@ async def discover_episode_urls_from_paginated_grid(
     state = await episode_grid_state(page)
     if not state:
         return False, []
+    await install_discovery_popup_guard(page)
 
     print(
         f"Found paginated All Episodes grid: page {state['current_page']} "
@@ -490,9 +591,12 @@ async def discover_episode_urls_from_paginated_grid(
     )
     while state["current_page"] > 1:
         expected_page = state["current_page"] - 1
+        pages_before_click = list(page.context.pages)
+        stable_url = page.url
         if not await click_episode_grid_control(page, "PREV"):
             print("Could not return the episode grid to page 1.", file=sys.stderr)
             break
+        await settle_guarded_click(page, pages_before_click, stable_url, 0.1)
         if not await wait_for_episode_grid_page(page, expected_page):
             print("Episode-grid PREV navigation stalled.", file=sys.stderr)
             break
@@ -530,12 +634,18 @@ async def discover_episode_urls_from_paginated_grid(
         ]
 
         for episode_number in missing_numbers:
+            pages_before_click = list(page.context.pages)
+            stable_url = page.url
             if not await click_episode_grid_control(page, episode_number):
                 print(f"Could not click episode {episode_number}; continuing.", file=sys.stderr)
                 continue
-            if per_click_wait > 0:
-                await page.wait_for_timeout(per_click_wait * 1000)
-            click_values = [page.url, *captured_values[captured_cursor:]]
+            popup_values, _ = await settle_guarded_click(
+                page,
+                pages_before_click,
+                stable_url,
+                per_click_wait,
+            )
+            click_values = [page.url, *popup_values, *captured_values[captured_cursor:]]
             captured_cursor = len(captured_values)
             merge(click_values)
             if episode_number not in episode_numbers_in_urls(discovered):
@@ -544,9 +654,12 @@ async def discover_episode_urls_from_paginated_grid(
         if current_page >= state["total_pages"]:
             break
         expected_page = current_page + 1
+        pages_before_click = list(page.context.pages)
+        stable_url = page.url
         if not await click_episode_grid_control(page, "NEXT"):
             print("Episode-grid NEXT control was not clickable.", file=sys.stderr)
             break
+        await settle_guarded_click(page, pages_before_click, stable_url, 0.1)
         if not await wait_for_episode_grid_page(page, expected_page):
             print("Episode-grid NEXT navigation stalled.", file=sys.stderr)
             break

@@ -218,11 +218,25 @@ class EpisodeExtractionTests(unittest.TestCase):
             list(range(101, 201)),
         )
 
+    def test_detects_blank_and_cross_origin_click_diversions(self):
+        stable = "https://media.example/show#S1-E1-100"
+        self.assertTrue(capture.unexpected_interactive_navigation("about:blank", stable))
+        self.assertTrue(
+            capture.unexpected_interactive_navigation("https://ads.example/pop", stable)
+        )
+        self.assertFalse(
+            capture.unexpected_interactive_navigation(
+                "https://media.example/show#S1-E2-101",
+                stable,
+            )
+        )
+
 
 class PaginatedEpisodeGridTests(unittest.IsolatedAsyncioTestCase):
     async def test_scans_pages_and_clicks_only_unresolved_episode_numbers(self):
         page = mock.Mock(url="https://media.example/show")
         page.wait_for_timeout = mock.AsyncMock()
+        page.context = mock.Mock(pages=[page])
         states = [
             {
                 "current_page": 1,
@@ -261,6 +275,16 @@ class PaginatedEpisodeGridTests(unittest.IsolatedAsyncioTestCase):
                 capture,
                 "wait_for_episode_grid_page",
                 new=mock.AsyncMock(return_value=True),
+            ),
+            mock.patch.object(
+                capture,
+                "install_discovery_popup_guard",
+                new=mock.AsyncMock(),
+            ),
+            mock.patch.object(
+                capture,
+                "settle_guarded_click",
+                new=mock.AsyncMock(return_value=([], False)),
             ),
             mock.patch.object(
                 capture,
