@@ -521,96 +521,53 @@ def unexpected_interactive_navigation(current_url: str, stable_url: str) -> bool
     )
 
 
-DISCOVERY_POPUP_GUARD_FUNCTION = r"""
-        () => {
-          if (window.__downloaderPopupGuardInstalled) return;
-          window.__downloaderPopupGuardInstalled = true;
-          window.__downloaderBlockedPopupUrls = [];
-          window.open = (...args) => {
-            const target = String(args[0] || '');
-            if (target) window.__downloaderBlockedPopupUrls.push(target);
-            const noop = () => undefined;
-            return new Proxy({
-              closed: false,
-              close: noop,
-              focus: noop,
-              blur: noop,
-              postMessage: noop,
-              location: { href: target },
-            }, {
-              get(object, property) {
-                return property in object ? object[property] : noop;
-              },
-            });
-          };
-        }
-        """
-
-
-async def install_discovery_popup_guard(page: Any) -> None:
-    """Block scripted pop-ups while retaining their target URLs for discovery."""
-    await page.evaluate(DISCOVERY_POPUP_GUARD_FUNCTION)
-
-
-async def prepare_discovery_page(context: Any, page: Any) -> None:
-    """Install the guard before navigation and in the current startup document."""
-    await context.add_init_script(f"({DISCOVERY_POPUP_GUARD_FUNCTION})()")
-    await install_discovery_popup_guard(page)
-
-
-async def drain_blocked_popup_urls(page: Any) -> list[str]:
-    try:
-        values = await page.evaluate(
-            r"""
-            () => {
-              const values = Array.from(window.__downloaderBlockedPopupUrls || []);
-              window.__downloaderBlockedPopupUrls = [];
-              return values;
-            }
-            """
-        )
-    except Exception:
-        return []
-    return [str(value) for value in values if value]
-
-
 async def settle_guarded_click(
     page: Any,
     pages_before_click: list[Any],
     stable_url: str,
     wait_seconds: float,
 ) -> tuple[list[str], bool]:
-    """Close pop-ups and recover the primary page after an interactive click."""
-    if wait_seconds > 0:
-        await page.wait_for_timeout(wait_seconds * 1000)
-
-    popup_values = await drain_blocked_popup_urls(page)
+    """Observe browser state without modifying site JavaScript."""
+    popup_values: list[str] = []
+    seen_popups: set[int] = set()
     context = page.context
-    for candidate in list(context.pages):
-        if candidate is page or any(candidate is existing for existing in pages_before_click):
-            continue
-        try:
-            popup_values.append(candidate.url)
-        finally:
-            await close_page_quietly(candidate)
-
     recovered = False
-    if not page.is_closed() and unexpected_interactive_navigation(page.url, stable_url):
-        print(
-            "Interactive click diverted the primary tab; restoring the episode page.",
-            file=sys.stderr,
-        )
-        recovered = True
-        try:
-            await page.go_back(wait_until="domcontentloaded", timeout=10_000)
-        except Exception:
-            pass
-        if unexpected_interactive_navigation(page.url, stable_url):
-            await page.goto(stable_url, wait_until="domcontentloaded", timeout=20_000)
-        await install_discovery_popup_guard(page)
+    deadline = asyncio.get_running_loop().time() + max(wait_seconds, 0)
+    first_check = True
+    while first_check or asyncio.get_running_loop().time() < deadline:
+        first_check = False
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining > 0:
+            await page.wait_for_timeout(min(100, remaining * 1000))
+
+        for candidate in list(context.pages):
+            if (
+                candidate is page
+                or any(candidate is existing for existing in pages_before_click)
+                or id(candidate) in seen_popups
+            ):
+                continue
+            seen_popups.add(id(candidate))
+            try:
+                popup_values.append(candidate.url)
+            finally:
+                await close_page_quietly(candidate)
+
+        if not page.is_closed() and unexpected_interactive_navigation(page.url, stable_url):
+            print(
+                "Primary tab was diverted; restoring the requested page.",
+                file=sys.stderr,
+            )
+            recovered = True
+            try:
+                await page.go_back(wait_until="domcontentloaded", timeout=10_000)
+            except Exception:
+                pass
+            if unexpected_interactive_navigation(page.url, stable_url):
+                await page.goto(stable_url, wait_until="domcontentloaded", timeout=20_000)
 
     if popup_values:
-        print(f"Suppressed {len(popup_values)} unexpected pop-up target(s).", file=sys.stderr)
+        print(f"Closed {len(popup_values)} unexpected pop-up tab(s).", file=sys.stderr)
     return popup_values, recovered
 
 
@@ -631,7 +588,7 @@ async def navigate_initial_page(page: Any, url: str, discovery: bool) -> None:
             return
         if attempt < attempts:
             print(
-                "Initial page navigation was diverted; retrying once under the discovery guard.",
+                "Initial page navigation was diverted; retrying once.",
                 file=sys.stderr,
             )
 
@@ -658,7 +615,6 @@ async def discover_episode_urls_from_paginated_grid(
     state = await episode_grid_state(page)
     if not state:
         return False, []
-    await install_discovery_popup_guard(page)
 
     print(
         f"Found paginated All Episodes grid: page {state['current_page']} "
@@ -1034,8 +990,7 @@ async def main() -> int:
             args.extension_dir,
         )
         page = await reuse_or_create_context_page(context)
-        if args.discover_episode_urls:
-            await prepare_discovery_page(context, page)
+        pages_before_navigation = list(context.pages)
 
         async def on_request(request):
             if found.done():
@@ -1076,7 +1031,13 @@ async def main() -> int:
             await click_top_right(page, args.top_right_click_delay, args.top_right_click_offset)
 
         if args.discover_episode_urls:
-            await page.wait_for_timeout(max(args.discover_wait, 0) * 1000)
+            popup_values, _ = await settle_guarded_click(
+                page,
+                pages_before_navigation,
+                args.url,
+                max(args.discover_wait, 0),
+            )
+            discovery_values.extend(popup_values)
             discovery_values.extend(await collect_page_values(page))
             if args.discover_debug_output:
                 args.discover_debug_output.parent.mkdir(parents=True, exist_ok=True)

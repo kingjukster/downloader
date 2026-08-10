@@ -386,11 +386,6 @@ class PaginatedEpisodeGridTests(unittest.IsolatedAsyncioTestCase):
             ),
             mock.patch.object(
                 capture,
-                "install_discovery_popup_guard",
-                new=mock.AsyncMock(),
-            ),
-            mock.patch.object(
-                capture,
                 "settle_guarded_click",
                 new=mock.AsyncMock(return_value=([], False)),
             ),
@@ -497,6 +492,28 @@ class BrowserPageLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await capture.navigate_initial_page(page, target, discovery=True)
 
         self.assertEqual(page.goto.await_count, 2)
+
+    async def test_browser_level_popup_containment_does_not_modify_site_javascript(self):
+        page = mock.Mock(url="https://media.example/show")
+        page.is_closed.return_value = False
+        page.wait_for_timeout = mock.AsyncMock()
+        page.evaluate = mock.AsyncMock()
+        popup = mock.Mock(url="https://ads.example/pop")
+        popup.is_closed.return_value = False
+        popup.close = mock.AsyncMock()
+        page.context = mock.Mock(pages=[page, popup])
+
+        popup_values, recovered = await capture.settle_guarded_click(
+            page,
+            [page],
+            page.url,
+            0,
+        )
+
+        self.assertEqual(popup_values, ["https://ads.example/pop"])
+        self.assertFalse(recovered)
+        popup.close.assert_awaited_once_with()
+        page.evaluate.assert_not_awaited()
 
 
 if __name__ == "__main__":
