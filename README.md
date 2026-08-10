@@ -20,6 +20,10 @@ movie or other single title and captures that page directly. Downloader-owned
 browser tabs are muted; this does not mute a normal Opera session. Downloads
 default to `downloads`.
 
+Flat episode links using `?episode=N` are treated as season 1 and receive names
+such as `S01E23 - Title.mp4`. Discovery never performs the optional playback
+click; that click is reserved for the later stream-capture stage.
+
 To inspect the resolved queue without downloading:
 
 ```powershell

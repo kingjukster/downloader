@@ -19,7 +19,7 @@ import shlex
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -110,6 +110,7 @@ def extract_episode_urls_from_values(values: list[str], base_url: str) -> list[s
 
     urls: list[str] = []
     seen: set[str] = set()
+    base = urlparse(base_url)
     for value in values:
         if not value:
             continue
@@ -136,6 +137,22 @@ def extract_episode_urls_from_values(values: list[str], base_url: str) -> list[s
             if candidate not in seen:
                 seen.add(candidate)
                 urls.append(candidate)
+
+        stripped = normalized.strip(" \t\r\n\"'<>`()[]{}=,;")
+        if not stripped or len(stripped) > max_url_prefix or any(char.isspace() for char in stripped):
+            continue
+        query_candidate = urljoin(base_url, stripped)
+        parsed_candidate = urlparse(query_candidate)
+        if (
+            parsed_candidate.scheme.casefold() != base.scheme.casefold()
+            or parsed_candidate.netloc.casefold() != base.netloc.casefold()
+            or parsed_candidate.path.rstrip("/") != base.path.rstrip("/")
+            or episode_query_number(query_candidate) is None
+        ):
+            continue
+        if query_candidate not in seen:
+            seen.add(query_candidate)
+            urls.append(query_candidate)
     return urls
 
 
@@ -212,6 +229,18 @@ def parse_episode_grid_summary(text: str) -> tuple[int, int, int | None] | None:
     return current_page, total_pages, total_items
 
 
+def episode_query_number(url: str) -> int | None:
+    """Read a positive ``episode=N`` query parameter when present."""
+    query = parse_qs(urlparse(url).query)
+    for key, values in query.items():
+        if key.casefold() != "episode":
+            continue
+        for value in values:
+            if value.isdigit() and int(value) > 0:
+                return int(value)
+    return None
+
+
 def episode_numbers_in_urls(urls: list[str]) -> set[int]:
     """Return episode numbers represented by the downloader's S/E fragments."""
     numbers: set[int] = set()
@@ -219,6 +248,10 @@ def episode_numbers_in_urls(urls: list[str]) -> set[int]:
         match = re.search(r"[#&]S\d+-E(\d+)(?:-|$)", unquote(url), re.IGNORECASE)
         if match:
             numbers.add(int(match.group(1)))
+            continue
+        query_number = episode_query_number(url)
+        if query_number is not None:
+            numbers.add(query_number)
     return numbers
 
 
@@ -989,7 +1022,11 @@ async def main() -> int:
         except PlaywrightTimeoutError:
             print("Page load timed out, but network capture is still active...", file=sys.stderr)
 
-        if args.top_right_click_delay is not None and not found.done():
+        if (
+            args.top_right_click_delay is not None
+            and not args.discover_episode_urls
+            and not found.done()
+        ):
             await click_top_right(page, args.top_right_click_delay, args.top_right_click_offset)
 
         if args.discover_episode_urls:

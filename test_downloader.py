@@ -41,6 +41,14 @@ class AutomaticExpansionTests(unittest.TestCase):
             "S03E07 - Star Trek Strange New Worlds (2022).mp4",
         )
 
+    def test_query_episode_output_uses_flat_season_numbering(self):
+        self.assertEqual(
+            downloader.default_output_path(
+                "https://media.example/anime/1735?play=true&episode=23"
+            ).name,
+            "S01E23 - 1735.mp4",
+        )
+
     def test_legacy_filename_cleanup_uses_season_first_and_preserves_clean_names(self):
         self.assertEqual(
             downloader.clean_media_filename(
@@ -103,6 +111,44 @@ class AutomaticExpansionTests(unittest.TestCase):
             [urls[2], urls[1], urls[0]],
         )
 
+    def test_query_episode_urls_sort_numerically(self):
+        urls = [
+            "https://media.example/anime/1735?play=true&episode=10",
+            "https://media.example/anime/1735?play=true&episode=2",
+            "https://media.example/anime/1735?play=true&episode=1",
+        ]
+        self.assertEqual(
+            sorted(urls, key=downloader.episode_url_sort_key),
+            [urls[2], urls[1], urls[0]],
+        )
+
+    @mock.patch.object(downloader.subprocess, "run")
+    def test_discovery_command_omits_legacy_top_right_click(self, run):
+        run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+        args = argparse.Namespace(
+            capture_script=downloader.DEFAULT_CAPTURE_SCRIPT,
+            discover_wait=5,
+            discover_debug_output=None,
+            discover_dropdowns=True,
+            episode_counts=None,
+            dropdown_wait=0.75,
+            visible=True,
+            user_data_dir=downloader.Path("work/profile"),
+            browser_executable=downloader.DEFAULT_OPERA_AIR,
+            extension_dir=[],
+            top_right_click_delay=15,
+            top_right_click_offset=24,
+        )
+
+        downloader.run_discovery(
+            args,
+            "https://media.example/anime/1735?play=true&episode=23",
+        )
+
+        command = run.call_args.args[0]
+        self.assertNotIn("--top-right-click-delay", command)
+        self.assertNotIn("--top-right-click-offset", command)
+
     @mock.patch.object(downloader, "discover_series_urls", return_value=[])
     def test_movie_falls_back_to_supplied_link(self, discover):
         args = make_args(discover_dropdowns=None)
@@ -154,6 +200,24 @@ class EpisodeExtractionTests(unittest.TestCase):
                 "https://media.example/shows/title#S1-E2-200",
                 "https://media.example/shows/title#S1-E1-100",
                 "https://media.example/shows/title#S3-E4-1200",
+            ],
+        )
+
+    def test_extracts_same_page_query_episode_urls(self):
+        base = "https://media.example/anime/1735?play=true&episode=23"
+        values = [
+            "https://media.example/anime/1735?play=true&episode=100",
+            "/anime/1735?play=true&episode=2",
+            "?play=true&episode=1",
+            "https://ads.example/anime/1735?play=true&episode=9",
+            "https://media.example/anime/other?play=true&episode=8",
+        ]
+        self.assertEqual(
+            capture.extract_episode_urls_from_values(values, base),
+            [
+                "https://media.example/anime/1735?play=true&episode=100",
+                "https://media.example/anime/1735?play=true&episode=2",
+                "https://media.example/anime/1735?play=true&episode=1",
             ],
         )
 

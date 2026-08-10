@@ -25,7 +25,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 DEFAULT_CAPTURE_SCRIPT = Path(__file__).resolve().with_name("capture_m3u8_curl.py")
@@ -141,18 +141,34 @@ def clean_media_filename(filename: str) -> str | None:
     return f"{stem}.mp4"
 
 
+def episode_coordinates(url: str) -> tuple[int, int] | None:
+    """Return season/episode coordinates from a fragment or flat query URL."""
+    decoded = unquote(url)
+    match = re.search(r"[#&]S(\d+)-E(\d+)(?:-|$)", decoded, re.IGNORECASE)
+    if match:
+        return int(match.group(1)), int(match.group(2))
+
+    query = parse_qs(urlparse(url).query)
+    for key, values in query.items():
+        if key.casefold() != "episode":
+            continue
+        for value in values:
+            if value.isdigit() and int(value) > 0:
+                return 1, int(value)
+    return None
+
+
 def default_output_path(url: str) -> Path:
     parsed = urlparse(url)
     path_parts = [safe_filename_part(part) for part in parsed.path.split("/") if part]
     path_parts = [part for part in path_parts if part]
-    fragment_match = re.search(r"S\d+-E\d+", parsed.fragment, flags=re.IGNORECASE)
     title_source = path_parts[-1] if path_parts else safe_filename_part(parsed.netloc)
     title, year = media_title_parts(title_source)
     stem = f"{title} ({year})" if year else title
-    if fragment_match:
-        episode_match = re.fullmatch(r"S(\d+)-E(\d+)", fragment_match.group(0), re.IGNORECASE)
-        assert episode_match is not None
-        stem = f"S{int(episode_match.group(1)):02d}E{int(episode_match.group(2)):02d} - {stem}"
+    coordinates = episode_coordinates(url)
+    if coordinates:
+        season, episode = coordinates
+        stem = f"S{season:02d}E{episode:02d} - {stem}"
 
     return Path.cwd() / f"{stem[:140]}.mp4"
 
@@ -250,10 +266,6 @@ def run_discovery(args: argparse.Namespace, url: str) -> list[str]:
         cmd.extend(["--executable-path", str(args.browser_executable)])
     for extension_dir in args.extension_dir:
         cmd.extend(["--extension-dir", str(extension_dir)])
-    if args.top_right_click_delay is not None:
-        cmd.extend(["--top-right-click-delay", str(args.top_right_click_delay)])
-        cmd.extend(["--top-right-click-offset", str(args.top_right_click_offset)])
-
     print("Running discovery:", " ".join(shlex.quote(p) for p in cmd), file=sys.stderr)
     result = subprocess.run(cmd, text=True, capture_output=True)
     if result.stderr:
@@ -278,10 +290,11 @@ def discover_series_urls(args: argparse.Namespace, urls: list[str]) -> list[str]
 def episode_url_sort_key(url: str) -> tuple[int, int, int, str]:
     """Put S/E episode URLs in playback order while keeping a stable fallback."""
     decoded = unquote(url)
-    match = re.search(r"[#&]S(\d+)-E(\d+)(?:-|$)", decoded, re.IGNORECASE)
-    if not match:
+    coordinates = episode_coordinates(url)
+    if not coordinates:
         return (1, 0, 0, decoded.casefold())
-    return (0, int(match.group(1)), int(match.group(2)), decoded.casefold())
+    season, episode = coordinates
+    return (0, season, episode, decoded.casefold())
 
 
 def should_auto_expand(args: argparse.Namespace, urls: list[str]) -> bool:
