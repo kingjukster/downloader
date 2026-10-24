@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -55,6 +56,25 @@ class FixtureScope:
 
 
 class JobTests(unittest.TestCase):
+    def test_pre_revision_database_migrates_without_replaying_job(self):
+        legacy_root = self.root / 'legacy'
+        legacy_root.mkdir()
+        job_id = 'a' * 64
+        db = sqlite3.connect(legacy_root / 'jobs.sqlite3')
+        with db:
+            db.execute("CREATE TABLE jobs(id TEXT PRIMARY KEY,intent TEXT,state TEXT,reason TEXT,cancel_requested INTEGER,result TEXT)")
+            db.execute('INSERT INTO jobs VALUES(?,?,?,?,?,?)', (job_id, '{}', 'cancelled', 'original cancellation', 0, '{}'))
+        db.close()
+        db = jobs.connect(legacy_root)
+        try:
+            row = jobs.snapshot(db, legacy_root, job_id)
+            self.assertEqual('cancelled', row['state'])
+            self.assertEqual(0, row['revision'])
+            with self.assertRaises(ValueError):
+                jobs.run(db, legacy_root, job_id, scope_factory=FixtureScope)
+        finally:
+            db.close()
+
     def setUp(self):
         self.temp = temporary()
         self.addCleanup(self.temp.cleanup)
@@ -80,10 +100,18 @@ class JobTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             jobs.bridge(self.root, {'operation': 'run'})
 
+    def test_bridge_rejects_cancellation_of_different_url_intent(self):
+        job_id = self.submit()
+        with self.assertRaisesRegex(ValueError, 'cancellation refused'):
+            jobs.bridge(self.root, {'operation': 'cancel', 'job_id': job_id, 'intent_sha256': 'f' * 64})
+        self.assertEqual('queued', jobs.snapshot(self.db, self.root, job_id)['state'])
+
     def test_queued_cancel_and_repeat_never_restarts(self):
         job_id = self.submit()
+        self.assertEqual(0, jobs.snapshot(self.db, self.root, job_id)['revision'])
         self.assertEqual('cancelled', jobs.cancel(self.db, self.root, job_id)['state'])
         self.assertEqual('cancelled', jobs.cancel(self.db, self.root, job_id)['state'])
+        self.assertEqual(1, jobs.snapshot(self.db, self.root, job_id)['revision'])
         self.submit()
         with self.assertRaisesRegex(ValueError, 'never replayed'):
             jobs.run(self.db, self.root, job_id, scope_factory=FixtureScope)

@@ -16,12 +16,22 @@ returns the same job. A changed URL is refused. For example, send this JSON to
 {"operation":"submit","request_key":"movie-001","url":"https://media.example/movie"}
 ```
 
-Use `{"operation":"status","job_id":"RETURNED_64_HEX_ID"}` or the same request
-with `"operation":"cancel"`. Job IDs are SHA-256 hashes of request keys. Then
+Use `{"operation":"status","job_id":"RETURNED_64_HEX_ID"}` to observe a job.
+To cancel, send `{"operation":"cancel","job_id":"RETURNED_64_HEX_ID","intent_sha256":"RETURNED_INTENT_HASH"}`.
+Cancellation verifies that hash inside its transaction before changing the job;
+a different URL using the same request key cannot be cancelled accidentally.
+Job IDs are SHA-256 hashes of request keys. Then
 explicitly execute `python assistant_jobs.py --state D:\private-download-state
 run JOB_ID --timeout 3600` to open the browser and download. Use the Python with
 the project's existing requirements installed. No dependencies are installed by
 the adapter. Keep its controller open and use another terminal for cancellation.
+
+Snapshots include an `intent_sha256` binding the URL and a monotonic `revision`.
+The assistant checks the URL binding before accepting status or outputs, and
+discards older revisions that arrive after a newer cancellation. Repeated
+cancellation requests do not advance the revision when nothing changes. Existing
+job databases gain a revision column transactionally, preserving their original
+state, identity and files; this never resets or replays work.
 
 The helper joins a Windows Job Object before loading the downloader. The
 controller holds the sole remaining job handle, so abrupt controller death kills
@@ -44,3 +54,15 @@ The assistant connection and command experience are documented in its companion
 fixtures, including descendant termination, use only temporary local files and
 Python processes, never a browser or network media. Run the focused checks with
 `python -m unittest test_assistant_jobs -v`. Output and logs have no storage quota.
+
+The complete existing baseline suite passed 51 tests under native Windows
+execution. The initial candidate passed 63 tests. In the restricted execution
+environment, even a trivial `asyncio.run(asyncio.sleep(0))` stalled before any
+downloader code, in Windows Python's socket-pair initialization. Bounded stack
+traces distinguish that environment limitation from the mocked browser test.
+The native qualification used the existing execution permission gate without
+changing security settings or accessing WSL. Private diagnostics remain in
+`work/qualification`, excluded from Git.
+The final follow-up passed all 65 tests with resource warnings treated as errors
+under a 60-second process bound, including revision migration and cancellation
+identity checks.

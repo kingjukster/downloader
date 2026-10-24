@@ -25,10 +25,14 @@ def connect(root):
     root.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(root / 'jobs.sqlite3', timeout=10)
     db.row_factory = sqlite3.Row
-    db.execute('''CREATE TABLE IF NOT EXISTS jobs (
-        id TEXT PRIMARY KEY, intent TEXT NOT NULL, state TEXT NOT NULL,
-        reason TEXT NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0,
-        result TEXT NOT NULL DEFAULT '{}')''')
+    with db:
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('''CREATE TABLE IF NOT EXISTS jobs (
+            id TEXT PRIMARY KEY, intent TEXT NOT NULL, state TEXT NOT NULL,
+            reason TEXT NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0,
+            result TEXT NOT NULL DEFAULT '{}', revision INTEGER NOT NULL DEFAULT 0)''')
+        if 'revision' not in {row['name'] for row in db.execute('PRAGMA table_info(jobs)')}:
+            db.execute('ALTER TABLE jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
     return db
 
 
@@ -43,7 +47,8 @@ def get(db, job_id):
 
 def snapshot(db, root, job_id):
     row = get(db, job_id)
-    return {'job_id': job_id, 'state': row['state'], 'reason': row['reason'],
+    return {'job_id': job_id, 'state': row['state'], 'reason': row['reason'], 'revision': row['revision'],
+            'intent_sha256': hashlib.sha256(row['intent'].encode()).hexdigest(),
             'cancel_requested': bool(row['cancel_requested']),
             'output_directory': str(Path(root).resolve() / job_id / 'files'),
             'result': json.loads(row['result']),
@@ -71,14 +76,16 @@ def submit(db, root, key, url):
     return snapshot(db, root, job_id)
 
 
-def cancel(db, root, job_id):
+def cancel(db, root, job_id, intent_sha256=None):
     with db:
         db.execute('BEGIN IMMEDIATE')
         row = get(db, job_id)
+        if intent_sha256 is not None and intent_sha256 != hashlib.sha256(row['intent'].encode()).hexdigest():
+            raise ValueError('Download URL intent does not match; cancellation refused')
         if row['state'] == 'queued':
-            db.execute("UPDATE jobs SET state='cancelled',reason='Cancelled before execution.' WHERE id=?", (job_id,))
-        elif row['state'] == 'running':
-            db.execute("UPDATE jobs SET cancel_requested=1,reason='Cancellation requested; waiting for verified process-tree closure.' WHERE id=?", (job_id,))
+            db.execute("UPDATE jobs SET state='cancelled',reason='Cancelled before execution.',revision=revision+1 WHERE id=?", (job_id,))
+        elif row['state'] == 'running' and not row['cancel_requested']:
+            db.execute("UPDATE jobs SET cancel_requested=1,reason='Cancellation requested; waiting for verified process-tree closure.',revision=revision+1 WHERE id=?", (job_id,))
     return snapshot(db, root, job_id)
 
 
@@ -105,7 +112,7 @@ def run(db, root, job_id, timeout=3600, scope_factory=None):
                 raise ValueError('Only a queued download can run. Claimed/terminal jobs are never replayed.')
             if db.execute("SELECT 1 FROM jobs WHERE state IN ('running','uncertain')").fetchone():
                 raise ValueError('Unresolved download owns this browser/state. Inspect it before dispatch.')
-            db.execute("UPDATE jobs SET state='running',reason='Execution claimed; outcome not yet known.' WHERE id=?", (job_id,))
+            db.execute("UPDATE jobs SET state='running',reason='Execution claimed; outcome not yet known.',revision=revision+1 WHERE id=?", (job_id,))
         state, reason = 'uncertain', 'Controller interrupted; inspect private evidence and process ownership. No replay.'
         result = {}
         try:
@@ -141,11 +148,11 @@ def run(db, root, job_id, timeout=3600, scope_factory=None):
             # Any error in launch, shutdown, or inventory preserves the claim.
             # __exit__ closes the job handle, but closure is not assumed verified.
             with db:
-                db.execute("UPDATE jobs SET state='uncertain',reason=? WHERE id=?",
+                db.execute("UPDATE jobs SET state='uncertain',reason=?,revision=revision+1 WHERE id=?",
                            ('Execution or evidence capture interrupted; inspect original process ownership and private files. No replay.', job_id))
             raise
         with db:
-            db.execute('UPDATE jobs SET state=?,reason=?,result=? WHERE id=?',
+            db.execute('UPDATE jobs SET state=?,reason=?,result=?,revision=revision+1 WHERE id=?',
                        (state, reason, json.dumps(result), job_id))
     return snapshot(db, root, job_id)
 
@@ -154,12 +161,18 @@ def bridge(root, request):
     if not isinstance(request, dict) or request.get('operation') not in {'submit', 'status', 'cancel'}:
         raise ValueError('Bridge supports submit, status and cancel only; execution is an explicit owner action')
     expected = {'operation', 'request_key', 'url'} if request['operation'] == 'submit' else {'operation', 'job_id'}
+    if request['operation'] == 'cancel':
+        expected.add('intent_sha256')
     if set(request) != expected:
         raise ValueError('Unexpected or missing bridge request fields')
     with closing(connect(root)) as db:
         if request['operation'] == 'submit':
             return submit(db, root, request['request_key'], request['url'])
-        return (cancel if request['operation'] == 'cancel' else snapshot)(db, root, request['job_id'])
+        if request['operation'] == 'cancel':
+            if not isinstance(request['intent_sha256'], str):
+                raise ValueError('Cancellation requires the saved URL intent hash')
+            return cancel(db, root, request['job_id'], request['intent_sha256'])
+        return snapshot(db, root, request['job_id'])
 
 
 def main():
