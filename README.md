@@ -2,6 +2,9 @@
 
 Use this only for streams you are authorized to access and save.
 
+Candidate integration: [durable Own Assistant jobs](ASSISTANT_JOBS.md).
+Saving a job does not start a download; execution remains an explicit Windows action.
+
 ## Windows setup
 
 Requirements:
