@@ -49,6 +49,17 @@ Claimed, failed and terminal jobs never rerun. Unknown execution/closure preserv
 block other runs in this state directory. There is no automatic recovery/reset,
 resume or replay; inspect process ownership and original evidence manually.
 
+Caught controller-side errors retain a separate private record under
+`STATE/controller-errors/JOB_ID-UNIQUE_ID.json`. It records the failure stage,
+exception type/message and any result metadata gathered before interruption.
+Status retains `result.controller_error_path`, not the raw diagnostic text.
+Like `worker.log`, this file can contain sensitive paths or request details;
+keep it private and out of source control. If writing the diagnostic itself
+fails, status records `controller_error_capture_failed: true` and the original
+exception is still raised. Neither case releases uncertain ownership, verifies
+closure, resets a job or permits replay. Abrupt controller termination may
+prevent this record from being written; a missing diagnostic proves nothing.
+
 The assistant connection and command experience are documented in its companion
 `docs/downloader.md`. Neither candidate was installed during development. Windows
 fixtures, including descendant termination, use only temporary local files and
@@ -66,3 +77,10 @@ changing security settings or accessing WSL. Private diagnostics remain in
 The final follow-up passed all 65 tests with resource warnings treated as errors
 under a 60-second process bound, including revision migration and cancellation
 identity checks.
+
+The subsequent controller-diagnostic refinement passed all 68 native Windows
+fixture tests under the same 60-second bound with resource warnings treated as
+errors. New fixtures cover closure evidence after database reopening, retained
+exit metadata after inventory failure, diagnostic-write failure, and private
+launch errors without replacing older evidence. This qualifies source fixtures,
+not installed integration, live browser/media behavior or WSL access.

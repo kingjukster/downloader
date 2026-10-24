@@ -9,11 +9,13 @@ import argparse
 from contextlib import closing
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 import time
+import uuid
 from urllib.parse import urlsplit
 
 
@@ -98,6 +100,19 @@ def inventory(directory):
     return files
 
 
+def retain_controller_error(root, job_id, stage, error, result):
+    directory = Path(root).resolve() / 'controller-errors'
+    directory.mkdir(exist_ok=True)
+    path = directory / (job_id + '-' + str(uuid.uuid4()) + '.json')
+    evidence = {'job_id': job_id, 'stage': stage, 'error_type': type(error).__name__,
+                'error': str(error), 'collected_result': result}
+    with path.open('x', encoding='utf-8') as stream:
+        json.dump(evidence, stream, ensure_ascii=True, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return str(path)
+
+
 def run(db, root, job_id, timeout=3600, scope_factory=None):
     if not isinstance(timeout, int) or not 1 <= timeout <= 21600:
         raise ValueError('Timeout must be 1-21600 seconds')
@@ -115,17 +130,21 @@ def run(db, root, job_id, timeout=3600, scope_factory=None):
             db.execute("UPDATE jobs SET state='running',reason='Execution claimed; outcome not yet known.',revision=revision+1 WHERE id=?", (job_id,))
         state, reason = 'uncertain', 'Controller interrupted; inspect private evidence and process ownership. No replay.'
         result = {}
+        stage = 'prepare_output'
         try:
             directory.mkdir(parents=True, exist_ok=False)
             output = directory / 'files'
             output.mkdir()
             with (directory / 'worker.log').open('xb') as log:
+                stage = 'start_process'
                 process = scope.start([sys.executable, str(SCRIPT), json.loads(row['intent'])['url'],
                                        '--parallel', '1', '--output', str(output)], log)
                 deadline = time.monotonic() + timeout
+                stage = 'observe_process'
                 while process.poll() is None:
                     if get(db, job_id)['cancel_requested'] or time.monotonic() >= deadline:
                         requested = bool(get(db, job_id)['cancel_requested'])
+                        stage = 'close_process_tree'
                         scope.stop()
                         process.wait(timeout=10)
                         state = 'cancelled' if requested else 'failed'
@@ -134,22 +153,31 @@ def run(db, root, job_id, timeout=3600, scope_factory=None):
                     time.sleep(0.1)
                 else:
                     code = process.wait()
+                    result['exit_code'] = code
+                    stage = 'close_process_tree'
                     scope.stop()  # Close browser descendants before publishing results.
                     state = 'awaiting_review' if code == 0 else 'failed'
                     reason = 'Download exited successfully; inspect saved files.' if code == 0 else 'Downloader failed; inspect private worker.log (may contain signed URLs).'
-                    result['exit_code'] = code
+                stage = 'collect_output'
                 result['files'] = inventory(output)
                 if state == 'awaiting_review' and not any(f['bytes'] > 0 for f in result['files']):
                     state, reason = 'failed', 'Downloader returned success without nonempty MP4 output.'
                 result['partial_files_possible'] = state != 'awaiting_review'
                 result['log_path'] = str(directory / 'worker.log')
                 result['media_verified'] = False
-        except BaseException:
+        except BaseException as error:
             # Any error in launch, shutdown, or inventory preserves the claim.
             # __exit__ closes the job handle, but closure is not assumed verified.
+            # Controller errors are not child output. Retain them privately so
+            # closing the CLI cannot erase the reason inspection is required.
+            try:
+                result['controller_error_path'] = retain_controller_error(root, job_id, stage, error, result)
+            except (OSError, ValueError, TypeError):
+                result['controller_error_capture_failed'] = True
             with db:
-                db.execute("UPDATE jobs SET state='uncertain',reason=?,revision=revision+1 WHERE id=?",
-                           ('Execution or evidence capture interrupted; inspect original process ownership and private files. No replay.', job_id))
+                db.execute("UPDATE jobs SET state='uncertain',reason=?,result=?,revision=revision+1 WHERE id=?",
+                           ('Execution or evidence capture interrupted; inspect original process ownership and private files. No replay.',
+                            json.dumps(result), job_id))
             raise
         with db:
             db.execute('UPDATE jobs SET state=?,reason=?,result=?,revision=revision+1 WHERE id=?',

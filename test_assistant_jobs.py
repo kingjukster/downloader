@@ -145,6 +145,15 @@ class JobTests(unittest.TestCase):
         with self.assertRaises(OSError):
             jobs.run(self.db, self.root, job_id, scope_factory=lambda: scope)
         self.assertEqual('uncertain', jobs.snapshot(self.db, self.root, job_id)['state'])
+        self.db.close()
+        self.db = jobs.connect(self.root)
+        self.addCleanup(self.db.close)
+        saved = jobs.snapshot(self.db, self.root, job_id)
+        evidence = json.loads(Path(saved['result']['controller_error_path']).read_text(encoding='utf-8'))
+        self.assertEqual(job_id, evidence['job_id'])
+        self.assertEqual('close_process_tree', evidence['stage'])
+        self.assertEqual('OSError', evidence['error_type'])
+        self.assertEqual('fixture closure not verified', evidence['error'])
         self.assertTrue((self.root / job_id / 'files' / 'Fixture.mp4').exists())
         other = self.submit(key='other')
         with self.assertRaisesRegex(ValueError, 'Unresolved'):
@@ -156,6 +165,45 @@ class JobTests(unittest.TestCase):
         self.assertEqual('failed', response['state'])
         self.assertEqual(2, response['result']['exit_code'])
         self.assertTrue(response['result']['partial_files_possible'])
+
+    def test_inventory_error_retains_collected_result_and_original_exception(self):
+        job_id = self.submit()
+        with patch.object(jobs, 'inventory', side_effect=OSError('fixture inventory unavailable')):
+            with self.assertRaisesRegex(OSError, 'fixture inventory unavailable'):
+                jobs.run(self.db, self.root, job_id, scope_factory=FixtureScope)
+        saved = jobs.snapshot(self.db, self.root, job_id)
+        self.assertEqual('uncertain', saved['state'])
+        self.assertEqual(0, saved['result']['exit_code'])
+        evidence = json.loads(Path(saved['result']['controller_error_path']).read_text(encoding='utf-8'))
+        self.assertEqual('collect_output', evidence['stage'])
+        self.assertEqual({'exit_code': 0}, evidence['collected_result'])
+
+    def test_diagnostic_write_failure_does_not_hide_original_error_or_release_claim(self):
+        job_id = self.submit()
+        with patch.object(jobs, 'retain_controller_error', side_effect=OSError('fixture evidence unavailable')):
+            with self.assertRaisesRegex(OSError, 'fixture closure not verified'):
+                jobs.run(self.db, self.root, job_id, scope_factory=lambda: FixtureScope(broken=True))
+        saved = jobs.snapshot(self.db, self.root, job_id)
+        self.assertEqual('uncertain', saved['state'])
+        self.assertTrue(saved['result']['controller_error_capture_failed'])
+        self.assertNotIn('controller_error_path', saved['result'])
+
+    def test_launch_error_is_retained_privately_without_replacing_existing_evidence(self):
+        job_id = self.submit()
+        retained = self.root / 'controller-errors'
+        retained.mkdir()
+        prior = retained / 'prior.json'
+        prior.write_text('original diagnostic', encoding='utf-8')
+        sensitive = 'fixture launch error with private token'
+        with patch.object(FixtureScope, 'start', side_effect=OSError(sensitive)):
+            with self.assertRaisesRegex(OSError, sensitive):
+                jobs.run(self.db, self.root, job_id, scope_factory=FixtureScope)
+        saved = jobs.snapshot(self.db, self.root, job_id)
+        self.assertNotIn(sensitive, json.dumps(saved))
+        evidence = json.loads(Path(saved['result']['controller_error_path']).read_text(encoding='utf-8'))
+        self.assertEqual('start_process', evidence['stage'])
+        self.assertEqual(sensitive, evidence['error'])
+        self.assertEqual('original diagnostic', prior.read_text(encoding='utf-8'))
 
     def test_success_without_output_is_failure(self):
         job_id = self.submit()
