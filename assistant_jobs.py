@@ -57,6 +57,15 @@ def snapshot(db, root, job_id):
             'note': 'Recorded evidence; running may be interrupted. Never replay a claimed job.'}
 
 
+def validate_new_url(parts):
+    if parts.username is not None or parts.password is not None:
+        raise ValueError('Supply one HTTP(S) page URL without embedded credentials')
+    try:
+        parts.port  # urlsplit defers numeric/range validation until this access.
+    except ValueError:
+        raise ValueError('Supply one HTTP(S) page URL with a valid port (0-65535)') from None
+
+
 def submit(db, root, key, url):
     if not isinstance(key, str) or not 1 <= len(key) <= 200:
         raise ValueError('Supply a stable request key of 1-200 characters')
@@ -73,6 +82,7 @@ def submit(db, root, key, url):
         if previous and previous['intent'] != intent:
             raise ValueError('Request key already belongs to a different download')
         if not previous:
+            validate_new_url(parts)  # Do not hide an identical legacy saved job.
             db.execute('INSERT INTO jobs(id,intent,state,reason) VALUES(?,?,?,?)',
                        (job_id, intent, 'queued', 'Saved only. Explicit owner run required; no browser opened.'))
     return snapshot(db, root, job_id)

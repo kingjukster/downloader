@@ -26,6 +26,11 @@ run JOB_ID --timeout 3600` to open the browser and download. Use the Python with
 the project's existing requirements installed. No dependencies are installed by
 the adapter. Keep its controller open and use another terminal for cancellation.
 
+New intent rejects nonnumeric/out-of-range URL ports and any user-info marker,
+including an empty one. Valid explicit ports and IPv6 literals are preserved
+without URL normalization. An identical job saved by an older validator still
+returns its original identity; this does not dispatch or approve that URL for use.
+
 Snapshots include an `intent_sha256` binding the URL and a monotonic `revision`.
 The assistant checks the URL binding before accepting status or outputs, and
 discards older revisions that arrive after a newer cancellation. Repeated
@@ -84,3 +89,7 @@ errors. New fixtures cover closure evidence after database reopening, retained
 exit metadata after inventory failure, diagnostic-write failure, and private
 launch errors without replacing older evidence. This qualifies source fixtures,
 not installed integration, live browser/media behavior or WSL access.
+
+The new-intent URL validation checkpoint passed all 69 native fixture tests under
+the same bound. It verifies rejection without saving a job, exact URL retention
+for valid explicit ports, and unchanged legacy lookup after database reopening.

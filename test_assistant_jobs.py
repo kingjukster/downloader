@@ -93,10 +93,26 @@ class JobTests(unittest.TestCase):
             self.submit(url='https://media.example/other')
         self.assertEqual(1, self.db.execute('SELECT count(*) FROM jobs').fetchone()[0])
 
+    def test_new_url_validation_preserves_legacy_lookup_and_valid_explicit_ports(self):
+        for index, url in enumerate(['https://media.example:not-a-port/movie', 'https://@media.example/movie']):
+            with patch.object(jobs, 'validate_new_url'):
+                original = jobs.submit(self.db, self.root, 'legacy-' + str(index), url)
+            self.db.close()
+            self.db = jobs.connect(self.root)
+            self.addCleanup(self.db.close)
+            self.assertEqual(original, jobs.submit(self.db, self.root, 'legacy-' + str(index), url))
+        for index, url in enumerate(['http://localhost:8080/movie', 'https://[::1]:8443/movie']):
+            saved = jobs.submit(self.db, self.root, 'valid-port-' + str(index), url)
+            self.assertEqual('queued', saved['state'])
+            self.assertEqual(url, json.loads(jobs.get(self.db, saved['job_id'])['intent'])['url'])
+
     def test_bad_inputs_and_bridge_cannot_execute(self):
-        for url in ['file:///etc/passwd', '--help', 'https://name:secret@example.com', 'https://a.example/\n--overwrite']:
+        for url in ['file:///etc/passwd', '--help', 'https://name:secret@example.com', 'https://a.example/\n--overwrite',
+                    'https://media.example:not-a-port/movie', 'https://media.example:65536/movie',
+                    'https://@media.example/movie', 'https://:@media.example/movie']:
             with self.assertRaises(ValueError):
                 self.submit(url=url)
+        self.assertEqual(0, self.db.execute('SELECT count(*) FROM jobs').fetchone()[0])
         with self.assertRaises(ValueError):
             jobs.bridge(self.root, {'operation': 'run'})
 
