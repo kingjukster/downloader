@@ -8,3 +8,4 @@ work/
 *.mp4
 *.part
 *.log
+*.sqlite3*
