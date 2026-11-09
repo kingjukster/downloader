@@ -4,11 +4,52 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
+import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from download_from_captured_m3u8 import clean_media_filename
+
+
+def rename_noreplace(source: Path, destination: Path) -> None:
+    """Move the directory entry only if the destination is still unoccupied."""
+    if os.name == "nt":
+        # Windows rename fails if the destination already exists.
+        source.rename(destination)
+        return
+    if sys.platform == "linux":
+        # renameat2 makes the no-replace check and move one filesystem operation.
+        # Unlike a hard link, it moves symlinks and needs no hard-link support.
+        at_fdcwd = -100
+        rename_noreplace_flag = 1
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            at_fdcwd, os.fsencode(source), at_fdcwd, os.fsencode(destination), rename_noreplace_flag
+        )
+    elif sys.platform == "darwin":
+        # macOS provides the same atomic exclusion through renamex_np.
+        rename_excl_flag = 0x00000004
+        renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(source), os.fsencode(destination), rename_excl_flag)
+    else:
+        raise OSError("Atomic no-replace rename is unsupported on this platform")
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+            raise OSError(
+                error,
+                "Atomic no-replace rename is unavailable on this filesystem",
+                str(destination),
+            )
+        raise OSError(error, os.strerror(error), str(destination))
 
 
 def build_plan(roots: list[Path]) -> tuple[list[tuple[Path, Path]], list[dict[str, str]]]:
@@ -26,7 +67,7 @@ def build_plan(roots: list[Path]) -> tuple[list[tuple[Path, Path]], list[dict[st
                 continue
             destination = source.with_name(clean_name)
             destination_key = str(destination).casefold()
-            if destination.exists():
+            if destination.exists() or destination.is_symlink():
                 skipped.append({"path": str(source), "reason": f"destination exists: {destination}"})
                 continue
             if destination_key in reserved:
@@ -48,9 +89,16 @@ def main() -> int:
     plan, skipped = build_plan(roots)
     changes: list[dict[str, str]] = []
     for source, destination in plan:
-        print(f"{source} -> {destination}")
         if args.apply:
-            source.rename(destination)
+            try:
+                rename_noreplace(source, destination)
+            except OSError as error:
+                # A directory claimed after planning can report EISDIR or ENOTEMPTY.
+                if error.errno not in (errno.EEXIST, errno.EISDIR, errno.ENOTEMPTY):
+                    raise
+                skipped.append({"path": str(source), "reason": f"destination exists: {destination}"})
+                continue
+        print(f"{source} -> {destination}")
         changes.append({"from": str(source), "to": str(destination)})
 
     report = {
@@ -58,7 +106,7 @@ def main() -> int:
         "mode": "apply" if args.apply else "preview",
         "roots": [str(root) for root in roots],
         "renamed_count": len(changes) if args.apply else 0,
-        "planned_count": len(changes),
+        "planned_count": len(plan),
         "skipped_count": len(skipped),
         "changes": changes,
         "skipped": skipped,
