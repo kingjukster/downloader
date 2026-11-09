@@ -99,3 +99,5 @@ python .\rename_downloaded_media.py .\downloads "F:\Dad Movies"
 
 Add `--apply --log .\work\rename-log.json` after reviewing the preview. Existing
 destinations are never overwritten; collisions are skipped and written to the log.
+Apply mode supports Windows, Linux, and macOS on filesystems with atomic
+no-replace rename support. If that support is unavailable, it stops safely.

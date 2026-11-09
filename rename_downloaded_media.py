@@ -32,17 +32,24 @@ def rename_noreplace(source: Path, destination: Path) -> None:
         result = renameat2(
             at_fdcwd, os.fsencode(source), at_fdcwd, os.fsencode(destination), rename_noreplace_flag
         )
-        if result != 0:
-            error = ctypes.get_errno()
-            if error in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
-                raise OSError(
-                    error,
-                    "Atomic no-replace rename is unavailable on this filesystem",
-                    str(destination),
-                )
-            raise OSError(error, os.strerror(error), str(destination))
-        return
-    raise OSError("Atomic no-replace rename is unsupported on this platform")
+    elif sys.platform == "darwin":
+        # macOS provides the same atomic exclusion through renamex_np.
+        rename_excl_flag = 0x00000004
+        renamex_np = ctypes.CDLL(None, use_errno=True).renamex_np
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(os.fsencode(source), os.fsencode(destination), rename_excl_flag)
+    else:
+        raise OSError("Atomic no-replace rename is unsupported on this platform")
+    if result != 0:
+        error = ctypes.get_errno()
+        if error in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+            raise OSError(
+                error,
+                "Atomic no-replace rename is unavailable on this filesystem",
+                str(destination),
+            )
+        raise OSError(error, os.strerror(error), str(destination))
 
 
 def build_plan(roots: list[Path]) -> tuple[list[tuple[Path, Path]], list[dict[str, str]]]:
@@ -85,7 +92,10 @@ def main() -> int:
         if args.apply:
             try:
                 rename_noreplace(source, destination)
-            except FileExistsError:
+            except OSError as error:
+                # A directory claimed after planning can report EISDIR or ENOTEMPTY.
+                if error.errno not in (errno.EEXIST, errno.EISDIR, errno.ENOTEMPTY):
+                    raise
                 skipped.append({"path": str(source), "reason": f"destination exists: {destination}"})
                 continue
         print(f"{source} -> {destination}")

@@ -73,6 +73,29 @@ class RenameCollisionTests(unittest.TestCase):
         self.assertEqual(report['skipped_count'], 1)
         self.assertEqual(report['changes'], [])
 
+    def test_directory_claimed_after_planning_is_skipped_and_other_rename_continues(self):
+        blocked_source, blocked_destination = self.paths(9)
+        good_source, good_destination = self.paths(10)
+        real_rename = rename_tool.rename_noreplace
+
+        def competing_rename(src, dst):
+            if src == blocked_source:
+                Path(dst).mkdir()
+                (Path(dst) / 'other-process.txt').write_bytes(b'occupied')
+            return real_rename(src, dst)
+
+        with mock.patch.object(rename_tool, 'rename_noreplace', side_effect=competing_rename):
+            report, _ = self.run_cli('--apply')
+        self.assertEqual(blocked_source.read_bytes(), b'source 9')
+        self.assertEqual((blocked_destination / 'other-process.txt').read_bytes(), b'occupied')
+        self.assertFalse(good_source.exists())
+        self.assertEqual(good_destination.read_bytes(), b'source 10')
+        self.assertEqual(report['planned_count'], 2)
+        self.assertEqual(report['renamed_count'], 1)
+        self.assertEqual(report['skipped_count'], 1)
+        self.assertIn('destination exists', report['skipped'][0]['reason'])
+        self.assertEqual(report['changes'], [{'from': str(good_source), 'to': str(good_destination)}])
+
     @unittest.skipIf(os.name == 'nt', 'Creating symlinks requires optional Windows privileges')
     def test_dangling_destination_claimed_after_planning_is_skipped(self):
         source, destination = self.paths(9)
@@ -125,6 +148,22 @@ class RenameCollisionTests(unittest.TestCase):
         self.assertEqual(report['renamed_count'], 1)
         self.assertFalse(source.exists())
         self.assertEqual(destination.read_bytes(), b'source 9')
+
+    def test_macos_exclusive_rename_reports_an_occupied_destination(self):
+        source, destination = self.paths(9)
+        native_rename = mock.Mock(return_value=-1)
+        library = mock.Mock(renamex_np=native_rename)
+        with mock.patch.object(rename_tool.sys, 'platform', 'darwin'):
+            with mock.patch.object(rename_tool.os, 'name', 'posix'):
+                with mock.patch.object(rename_tool.ctypes, 'CDLL', return_value=library):
+                    with mock.patch.object(rename_tool.ctypes, 'get_errno', return_value=errno.EEXIST):
+                        with self.assertRaises(FileExistsError):
+                            rename_tool.rename_noreplace(source, destination)
+        native_rename.assert_called_once_with(
+            os.fsencode(source), os.fsencode(destination), 0x00000004
+        )
+        self.assertEqual(source.read_bytes(), b'source 9')
+        self.assertFalse(destination.exists())
 
     def test_collision_does_not_stop_independent_rename(self):
         blocked_source, blocked_destination = self.paths(9)
