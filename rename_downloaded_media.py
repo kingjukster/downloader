@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import json
 import os
 import sys
@@ -33,6 +34,12 @@ def rename_noreplace(source: Path, destination: Path) -> None:
         )
         if result != 0:
             error = ctypes.get_errno()
+            if error in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
+                raise OSError(
+                    error,
+                    "Atomic no-replace rename is unavailable on this filesystem",
+                    str(destination),
+                )
             raise OSError(error, os.strerror(error), str(destination))
         return
     raise OSError("Atomic no-replace rename is unsupported on this platform")
