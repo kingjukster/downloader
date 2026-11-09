@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def build_plan(roots: list[Path]) -> tuple[list[tuple[Path, Path]], list[dict[st
                 continue
             destination = source.with_name(clean_name)
             destination_key = str(destination).casefold()
-            if destination.exists():
+            if destination.exists() or destination.is_symlink():
                 skipped.append({"path": str(source), "reason": f"destination exists: {destination}"})
                 continue
             if destination_key in reserved:
@@ -48,9 +49,16 @@ def main() -> int:
     plan, skipped = build_plan(roots)
     changes: list[dict[str, str]] = []
     for source, destination in plan:
-        print(f"{source} -> {destination}")
         if args.apply:
-            source.rename(destination)
+            try:
+                # A hard link claims the name exclusively, even if another process
+                # creates it after planning. Both paths are in the same directory.
+                os.link(source, destination)
+            except FileExistsError:
+                skipped.append({"path": str(source), "reason": f"destination exists: {destination}"})
+                continue
+            source.unlink()
+        print(f"{source} -> {destination}")
         changes.append({"from": str(source), "to": str(destination)})
 
     report = {
@@ -58,7 +66,7 @@ def main() -> int:
         "mode": "apply" if args.apply else "preview",
         "roots": [str(root) for root in roots],
         "renamed_count": len(changes) if args.apply else 0,
-        "planned_count": len(changes),
+        "planned_count": len(plan),
         "skipped_count": len(skipped),
         "changes": changes,
         "skipped": skipped,
