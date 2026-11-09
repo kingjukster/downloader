@@ -1,5 +1,6 @@
 """Data preservation regressions for legacy filename cleanup."""
 import contextlib
+import errno
 import io
 import json
 import os
@@ -57,13 +58,13 @@ class RenameCollisionTests(unittest.TestCase):
 
     def test_destination_claimed_after_planning_is_skipped(self):
         source, destination = self.paths(9)
-        real_link = os.link
+        real_rename = rename_tool.rename_noreplace
 
-        def competing_link(src, dst):
+        def competing_rename(src, dst):
             Path(dst).write_bytes(b'other process')
-            return real_link(src, dst)
+            return real_rename(src, dst)
 
-        with mock.patch.object(rename_tool.os, 'link', side_effect=competing_link):
+        with mock.patch.object(rename_tool, 'rename_noreplace', side_effect=competing_rename):
             report, _ = self.run_cli('--apply')
         self.assertEqual(source.read_bytes(), b'source 9')
         self.assertEqual(destination.read_bytes(), b'other process')
@@ -75,13 +76,13 @@ class RenameCollisionTests(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'Creating symlinks requires optional Windows privileges')
     def test_dangling_destination_claimed_after_planning_is_skipped(self):
         source, destination = self.paths(9)
-        real_link = os.link
+        real_rename = rename_tool.rename_noreplace
 
-        def competing_link(src, dst):
+        def competing_rename(src, dst):
             Path(dst).symlink_to('missing-target')
-            return real_link(src, dst)
+            return real_rename(src, dst)
 
-        with mock.patch.object(rename_tool.os, 'link', side_effect=competing_link):
+        with mock.patch.object(rename_tool, 'rename_noreplace', side_effect=competing_rename):
             report, _ = self.run_cli('--apply')
         self.assertEqual(source.read_bytes(), b'source 9')
         self.assertTrue(destination.is_symlink())
@@ -89,6 +90,41 @@ class RenameCollisionTests(unittest.TestCase):
         self.assertEqual(report['renamed_count'], 0)
         self.assertEqual(report['skipped_count'], 1)
         self.assertIn('destination exists', report['skipped'][0]['reason'])
+
+    @unittest.skipIf(os.name == 'nt', 'Creating symlinks requires optional Windows privileges')
+    def test_source_symlink_moves_without_changing_its_target(self):
+        source, destination = self.paths(9)
+        source.unlink()
+        target = self.root / 'target.bin'
+        target.write_bytes(b'target data')
+        source.symlink_to(target.name)
+
+        report, _ = self.run_cli('--apply')
+        self.assertEqual(report['renamed_count'], 1)
+        self.assertFalse(source.is_symlink())
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), target.name)
+        self.assertEqual(target.read_bytes(), b'target data')
+
+    @unittest.skipIf(os.name == 'nt', 'Creating symlinks requires optional Windows privileges')
+    def test_dangling_source_symlink_moves_without_following(self):
+        source, destination = self.paths(9)
+        source.unlink()
+        source.symlink_to('missing-target')
+
+        report, _ = self.run_cli('--apply')
+        self.assertEqual(report['renamed_count'], 1)
+        self.assertFalse(source.is_symlink())
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), 'missing-target')
+
+    def test_normal_rename_does_not_require_hard_links(self):
+        source, destination = self.paths(9)
+        with mock.patch.object(rename_tool.os, 'link', side_effect=OSError(errno.ENOTSUP, 'Hard links unavailable')):
+            report, _ = self.run_cli('--apply')
+        self.assertEqual(report['renamed_count'], 1)
+        self.assertFalse(source.exists())
+        self.assertEqual(destination.read_bytes(), b'source 9')
 
     def test_collision_does_not_stop_independent_rename(self):
         blocked_source, blocked_destination = self.paths(9)

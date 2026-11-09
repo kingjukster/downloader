@@ -4,12 +4,38 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from download_from_captured_m3u8 import clean_media_filename
+
+
+def rename_noreplace(source: Path, destination: Path) -> None:
+    """Move the directory entry only if the destination is still unoccupied."""
+    if os.name == "nt":
+        # Windows rename fails if the destination already exists.
+        source.rename(destination)
+        return
+    if sys.platform == "linux":
+        # renameat2 makes the no-replace check and move one filesystem operation.
+        # Unlike a hard link, it moves symlinks and needs no hard-link support.
+        at_fdcwd = -100
+        rename_noreplace_flag = 1
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            at_fdcwd, os.fsencode(source), at_fdcwd, os.fsencode(destination), rename_noreplace_flag
+        )
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error), str(destination))
+        return
+    raise OSError("Atomic no-replace rename is unsupported on this platform")
 
 
 def build_plan(roots: list[Path]) -> tuple[list[tuple[Path, Path]], list[dict[str, str]]]:
@@ -51,13 +77,10 @@ def main() -> int:
     for source, destination in plan:
         if args.apply:
             try:
-                # A hard link claims the name exclusively, even if another process
-                # creates it after planning. Both paths are in the same directory.
-                os.link(source, destination)
+                rename_noreplace(source, destination)
             except FileExistsError:
                 skipped.append({"path": str(source), "reason": f"destination exists: {destination}"})
                 continue
-            source.unlink()
         print(f"{source} -> {destination}")
         changes.append({"from": str(source), "to": str(destination)})
 
