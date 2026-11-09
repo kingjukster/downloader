@@ -72,6 +72,24 @@ class RenameCollisionTests(unittest.TestCase):
         self.assertEqual(report['skipped_count'], 1)
         self.assertEqual(report['changes'], [])
 
+    @unittest.skipIf(os.name == 'nt', 'Creating symlinks requires optional Windows privileges')
+    def test_dangling_destination_claimed_after_planning_is_skipped(self):
+        source, destination = self.paths(9)
+        real_link = os.link
+
+        def competing_link(src, dst):
+            Path(dst).symlink_to('missing-target')
+            return real_link(src, dst)
+
+        with mock.patch.object(rename_tool.os, 'link', side_effect=competing_link):
+            report, _ = self.run_cli('--apply')
+        self.assertEqual(source.read_bytes(), b'source 9')
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(os.readlink(destination), 'missing-target')
+        self.assertEqual(report['renamed_count'], 0)
+        self.assertEqual(report['skipped_count'], 1)
+        self.assertIn('destination exists', report['skipped'][0]['reason'])
+
     def test_collision_does_not_stop_independent_rename(self):
         blocked_source, blocked_destination = self.paths(9)
         good_source, good_destination = self.paths(10)
