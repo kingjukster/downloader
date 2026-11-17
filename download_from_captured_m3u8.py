@@ -18,11 +18,14 @@ import argparse
 import copy
 import datetime as dt
 import json
+import math
+import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -381,12 +384,16 @@ def run_ffmpeg(
     if output.exists() and not overwrite:
         raise FileExistsError(f"output already exists, pass --overwrite to replace it: {output}")
 
+    ffprobe = ffprobe_for_ffmpeg(ffmpeg)
+    if not ffprobe:
+        raise RuntimeError("ffprobe is required to verify download completion")
+    source = media_metadata(ffprobe, m3u8_url, headers)
+    expected = media_duration(source)
+    if duration is not None:
+        expected = min(expected, duration) if expected else duration
+    partial = output.with_name(f"{output.stem}.{uuid.uuid4().hex}.partial{output.suffix}")
     header_blob = "".join(f"{header}\r\n" for header in headers)
-    cmd = [ffmpeg, "-hide_banner"]
-    if overwrite:
-        cmd.append("-y")
-    else:
-        cmd.append("-n")
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-n", "-progress", "pipe:1"]
     if duration is not None:
         cmd.extend(["-t", str(duration)])
     if header_blob:
@@ -401,13 +408,71 @@ def run_ffmpeg(
             m3u8_url,
             "-c",
             "copy",
-            str(output),
+            str(partial),
         ]
     )
 
     print("Downloading to:", output, file=sys.stderr)
     print("Running ffmpeg:", " ".join(shlex.quote(p) for p in cmd), file=sys.stderr)
-    return subprocess.call(cmd)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        print(f"Incomplete download retained at: {partial}", file=sys.stderr)
+        return result.returncode
+    if "progress=end" not in result.stdout.splitlines():
+        raise RuntimeError(f"FFmpeg exited without completing output; partial retained at {partial}")
+    valid, detail = validate_media_file(ffprobe, partial, expected)
+    if not valid:
+        raise RuntimeError(f"Download validation failed: {detail}; partial retained at {partial}")
+    if overwrite:
+        partial.replace(output)
+    else:
+        # Publish without replacing a file created by another worker in the meantime.
+        os.link(partial, output)
+        partial.unlink()
+    print(f"Verified download: {output} ({detail})", file=sys.stderr)
+    return 0
+
+
+def media_metadata(ffprobe: str, target: str, headers: list[str] | None = None) -> dict:
+    command = [ffprobe, "-v", "error"]
+    if headers is not None:
+        command.extend(["-allowed_segment_extensions", "ALL", "-extension_picky", "0"])
+        if headers:
+            command.extend(["-headers", "".join(f"{header}\r\n" for header in headers)])
+    command.extend(["-show_format", "-show_streams", "-of", "json", target])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    if result.returncode or result.stderr.strip():
+        raise ValueError("ffprobe could not read media cleanly")
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, dict):
+        raise ValueError("ffprobe returned invalid metadata")
+    return payload
+
+
+def media_duration(payload: dict) -> float | None:
+    try:
+        value = float(payload.get("format", {}).get("duration", 0))
+        return value if math.isfinite(value) and value > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def validate_media_file(ffprobe: str, path: Path, expected: float | None = None) -> tuple[bool, str]:
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return False, "missing or empty media file"
+        payload = media_metadata(ffprobe, str(path))
+        actual = media_duration(payload)
+        video = any(s.get("codec_type") == "video" and s.get("codec_name") not in (None, "png")
+                    and int(s.get("width", 0)) > 0 and int(s.get("height", 0)) > 0
+                    for s in payload.get("streams", []))
+        if not video or actual is None:
+            return False, "missing video or positive duration"
+        if expected and actual < expected - max(2.0, expected * 0.005):
+            return False, f"duration {actual:.2f}s is shorter than expected {expected:.2f}s"
+        return True, f"duration {actual:.2f}s"
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+        return False, str(error)
 
 
 def ffprobe_for_ffmpeg(ffmpeg: str) -> str | None:
@@ -675,13 +740,19 @@ def skip_existing_urls(
     urls: list[str],
     multiple: bool,
 ) -> list[str]:
-    """Remove URLs whose deterministic target already contains downloaded data."""
+    """Skip only media that passes local container validation."""
+    ffprobe = ffprobe_for_ffmpeg(shutil.which("ffmpeg") or "ffmpeg")
+    if not ffprobe:
+        raise RuntimeError("ffprobe is required to validate existing downloads")
     pending: list[str] = []
     for url in urls:
         output = intended_output_path(args, url, multiple)
-        if output.is_file() and output.stat().st_size > 0:
-            print(f"Skipping existing output: {output}", file=sys.stderr)
-            continue
+        if output.is_file():
+            valid, detail = validate_media_file(ffprobe, output)
+            if valid:
+                print(f"Skipping verified existing output: {output}", file=sys.stderr)
+                continue
+            print(f"Preserving invalid existing output: {output} ({detail})", file=sys.stderr)
         pending.append(url)
     return pending
 
