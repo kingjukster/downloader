@@ -26,7 +26,7 @@ def make_args(**overrides):
 
 
 class AutomaticExpansionTests(unittest.TestCase):
-    @mock.patch.object(downloader, "media_metadata", return_value={})
+    @mock.patch.object(downloader, "media_metadata", return_value={"format": {"duration": "3"}})
     @mock.patch.object(downloader, "ffprobe_for_ffmpeg", return_value="ffprobe")
     @mock.patch.object(downloader.subprocess, "run", return_value=mock.Mock(returncode=7))
     def test_ffmpeg_allows_extensionless_hls_segments_before_input(self, call, probe, metadata):
@@ -196,7 +196,7 @@ class AutomaticExpansionTests(unittest.TestCase):
         )
         self.assertFalse(discover.call_args.args[0].discover_dropdowns)
 
-    @mock.patch.object(downloader, "validate_media_file", return_value=(True, "valid"))
+    @mock.patch.object(downloader, "verify_existing_output", return_value=(True, "valid"))
     @mock.patch.object(downloader, "ffprobe_for_ffmpeg", return_value="ffprobe")
     def test_skip_existing_urls_keeps_only_missing_outputs(self, probe, validate):
         with tempfile.TemporaryDirectory() as directory:
@@ -206,6 +206,7 @@ class AutomaticExpansionTests(unittest.TestCase):
                 "https://media.example/show#S1-E2-102",
             ]
             existing = downloader.intended_output_path(args, urls[0], multiple=True)
+            existing.parent.mkdir(parents=True)
             existing.write_bytes(b"complete media")
             self.assertEqual(
                 downloader.skip_existing_urls(args, urls, multiple=True),
