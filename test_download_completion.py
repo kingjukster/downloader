@@ -15,7 +15,7 @@ class CompletionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "episode.mp4"
             with mock.patch.object(downloader, "ffprobe_for_ffmpeg", return_value="ffprobe"), \
-                 mock.patch.object(downloader, "media_metadata", return_value={}), \
+                 mock.patch.object(downloader, "media_metadata", return_value={"format": {"duration": "3"}}), \
                  mock.patch.object(downloader.subprocess, "run", return_value=mock.Mock(
                      returncode=0, stdout="progress=continue\n")):
                 with self.assertRaisesRegex(RuntimeError, "without completing"):
@@ -26,7 +26,7 @@ class CompletionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "episode.mp4"
             with mock.patch.object(downloader, "ffprobe_for_ffmpeg", return_value="ffprobe"), \
-                 mock.patch.object(downloader, "media_metadata", return_value={}), \
+                 mock.patch.object(downloader, "media_metadata", return_value={"format": {"duration": "3"}}), \
                  mock.patch.object(downloader.subprocess, "run", return_value=mock.Mock(
                      returncode=0, stdout="progress=end\n")):
                 with self.assertRaisesRegex(RuntimeError, "validation failed"):
@@ -44,7 +44,8 @@ class CompletionTests(unittest.TestCase):
                             "-hls_time", "1", "-hls_list_size", "0",
                             str(source)], check=True)
             output = root / "complete.mp4"
-            self.assertEqual(downloader.run_ffmpeg(ffmpeg, str(source), [], output, None, False), 0)
+            url = "https://example.com/movie"
+            self.assertEqual(downloader.run_ffmpeg(ffmpeg, str(source), [], output, None, False, page_url=url), 0)
             self.assertTrue(downloader.validate_media_file(ffprobe, output, 3)[0])
             self.assertFalse(downloader.validate_media_file(ffprobe, output, 26)[0])
             broken = root / "broken.mp4"

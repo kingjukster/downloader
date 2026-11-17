@@ -72,8 +72,13 @@ Useful overrides:
   custom controls do not expose every option at once.
 - `--parallel N` processes multiple discovered episodes concurrently. The
   default remains sequential to avoid browser-profile and server contention.
-- `--skip-existing` resumes a queue without reprocessing non-empty files at
-  their normal output paths.
+- `--skip-existing` resumes only after the existing file's verification receipt,
+  source duration, SHA256 hash and full-file decode pass. Files without matching
+  receipts are preserved and downloaded again under a collision-safe name.
+- `--expected-count N` fails before downloading if the resolved queue does not
+  contain exactly N unique items. Use the independently checked episode count
+  for a whole-season batch; successful discovery alone does not prove that a
+  site's catalog includes every episode.
 
 The browser may still require a manual login, consent click, or playback action.
 The existing `--url-file`, catalog, and explicit series-expansion modes remain
@@ -90,6 +95,34 @@ standard HLS media, the downloader stops with a consolidated rejection message.
 
 New downloads use media-library-friendly names such as `Movie Title (2026).mp4`
 and `S01E02 - Show Title (2026).mp4`.
+
+Episodes automatically go into `downloads/Show Title (2026)/`; `--output`
+selects the library root. Movies remain directly in that root. An explicit
+single output filename remains an override. Existing flat files are not moved
+or deleted automatically.
+
+Success requires a known source duration (or an explicitly requested clip
+duration), a readable container, matching duration, the source's audio/video
+stream types, and a clean full-file FFmpeg decode. Only then is the partial
+file published and a `.mp4.verified.json` receipt written beside it. Receipts
+contain source duration, stream requirements, byte count, SHA256, verification
+time and a hash of the requested page identity; they contain no source URL or
+request headers. A final audit checks the receipts and hashes for every new
+output before queue success; skipped outputs are fully decoded again.
+
+Any capture, download, validation or receipt failure produces a nonzero exit.
+Partial files remain for diagnosis. `--duration` creates an explicitly limited
+clip; its receipt cannot be reused as proof of a complete episode. Verification
+establishes completeness against the captured source, not editorial equivalence
+to a studio master. For a batch, success covers the explicit resolved queue;
+use `--expected-count` to detect missing entries.
+
+On the configured Windows server, `run_verified_series.ps1 -QueueFile
+'C:\path\to\episodes.txt' -ExpectedCount 9` runs the exact reviewed queue with
+these checks and per-show folders. The queue must contain the exact selected
+episode URLs. The launcher uses the existing SelectedDownloader virtual
+environment and dedicated Chrome profile; parameters can override those paths.
+It propagates failure status and does not run on a schedule.
 
 To preview cleanup of legacy URL-derived filenames without changing anything:
 

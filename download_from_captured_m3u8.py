@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -380,6 +381,7 @@ def run_ffmpeg(
     output: Path,
     duration: float | None,
     overwrite: bool,
+    page_url: str | None = None,
 ) -> int:
     if output.exists() and not overwrite:
         raise FileExistsError(f"output already exists, pass --overwrite to replace it: {output}")
@@ -391,6 +393,10 @@ def run_ffmpeg(
     expected = media_duration(source)
     if duration is not None:
         expected = min(expected, duration) if expected else duration
+    if expected is None:
+        raise RuntimeError("Cannot verify completion without a source duration or explicit --duration")
+    required_streams = {s.get("codec_type") for s in source.get("streams", [])} & {"audio", "video"}
+    required_streams.add("video")
     partial = output.with_name(f"{output.stem}.{uuid.uuid4().hex}.partial{output.suffix}")
     header_blob = "".join(f"{header}\r\n" for header in headers)
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-n", "-progress", "pipe:1"]
@@ -423,12 +429,23 @@ def run_ffmpeg(
     valid, detail = validate_media_file(ffprobe, partial, expected)
     if not valid:
         raise RuntimeError(f"Download validation failed: {detail}; partial retained at {partial}")
+    validate_full_decode(ffmpeg, ffprobe, partial, required_streams)
+    receipt = {
+        "version": 1, "expected_seconds": expected, "requested_duration": duration,
+        "required_streams": sorted(required_streams), "sha256": file_sha256(partial),
+        "bytes": partial.stat().st_size, "page_identity": page_identity(page_url),
+        "verified_at": dt.datetime.now(dt.timezone.utc).isoformat(), "full_decode": True,
+    }
     if overwrite:
         partial.replace(output)
     else:
         # Publish without replacing a file created by another worker in the meantime.
         os.link(partial, output)
         partial.unlink()
+    receipt_path = verification_path(output)
+    temporary = receipt_path.with_name(receipt_path.name + f".{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+    temporary.replace(receipt_path)
     print(f"Verified download: {output} ({detail})", file=sys.stderr)
     return 0
 
@@ -447,6 +464,62 @@ def media_metadata(ffprobe: str, target: str, headers: list[str] | None = None) 
     if not isinstance(payload, dict):
         raise ValueError("ffprobe returned invalid metadata")
     return payload
+
+
+def file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def page_identity(url: str | None) -> str | None:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest() if url else None
+
+
+def verification_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".verified.json")
+
+
+def validate_full_decode(ffmpeg: str, ffprobe: str, path: Path, required_streams: set[str]) -> None:
+    payload = media_metadata(ffprobe, str(path))
+    present = {s.get("codec_type") for s in payload.get("streams", [])}
+    if not required_streams <= present:
+        raise ValueError("Output is missing source audio/video streams")
+    command = [ffmpeg, "-v", "error", "-xerror", "-nostdin", "-i", str(path), "-map", "0:v:0"]
+    if "audio" in required_streams:
+        command.extend(["-map", "0:a:0"])
+    command.extend(["-f", "null", "-"])
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode or result.stderr.strip():
+        raise ValueError("Full-file decode failed: " + result.stderr[-2000:])
+
+
+def verify_existing_output(ffmpeg: str, path: Path, url: str, duration: float | None,
+                           *, decode: bool = True) -> tuple[bool, str]:
+    """A readable MP4 alone is insufficient evidence of a complete episode."""
+    try:
+        receipt = json.loads(verification_path(path).read_text(encoding="utf-8"))
+        expected = float(receipt["expected_seconds"])
+        if (receipt.get("version") != 1 or receipt.get("full_decode") is not True
+                or not math.isfinite(expected) or expected <= 0
+                or receipt.get("page_identity") != page_identity(url)
+                or receipt.get("requested_duration") != duration):
+            return False, "completion receipt does not match this request"
+        if receipt["bytes"] != path.stat().st_size or receipt["sha256"] != file_sha256(path):
+            return False, "file differs from its completion receipt"
+        ffprobe = ffprobe_for_ffmpeg(ffmpeg)
+        if not ffprobe:
+            return False, "ffprobe is required"
+        valid, detail = validate_media_file(ffprobe, path, expected)
+        if not valid:
+            return False, detail
+        streams = set(receipt["required_streams"])
+        if "video" not in streams or not streams <= {"video", "audio"}:
+            return False, "invalid stream requirements"
+        if decode:
+            validate_full_decode(ffmpeg, ffprobe, path, streams)
+        return True, detail
+    except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as error:
+        return False, str(error)
 
 
 def media_duration(payload: dict) -> float | None:
@@ -704,11 +777,22 @@ def intended_output_path(args: argparse.Namespace, url: str, multiple: bool) -> 
     if args.output:
         output = args.output.expanduser()
         if multiple or output.suffix == "":
-            output = output / default_output_path(url).name
+            output = output / relative_output_path(url)
     else:
-        output = DEFAULT_DOWNLOAD_DIR / default_output_path(url).name
+        output = DEFAULT_DOWNLOAD_DIR / relative_output_path(url)
 
     return output.resolve()
+
+
+def relative_output_path(url: str) -> Path:
+    filename = default_output_path(url).name
+    if episode_coordinates(url):
+        title = re.sub(r"^S\d+E\d+ - ", "", Path(filename).stem).rstrip(". ")
+        # Windows device names cannot be directory names, even with an extension.
+        if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", title, re.I):
+            title = "_" + title
+        return Path(title) / filename
+    return Path(filename)
 
 
 def resolve_output_path(args: argparse.Namespace, url: str, multiple: bool) -> Path:
@@ -740,20 +824,27 @@ def skip_existing_urls(
     urls: list[str],
     multiple: bool,
 ) -> list[str]:
-    """Skip only media that passes local container validation."""
-    ffprobe = ffprobe_for_ffmpeg(shutil.which("ffmpeg") or "ffmpeg")
-    if not ffprobe:
-        raise RuntimeError("ffprobe is required to validate existing downloads")
+    """Skip only files whose source-duration receipt and full decode pass."""
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
     pending: list[str] = []
     for url in urls:
         output = intended_output_path(args, url, multiple)
-        if output.is_file():
-            valid, detail = validate_media_file(ffprobe, output)
-            if valid:
-                print(f"Skipping verified existing output: {output}", file=sys.stderr)
+        # A preserved invalid original may have caused a verified replacement to
+        # use a numbered name. Match only our collision names, never other episodes.
+        candidates = [output]
+        if output.parent.is_dir():
+            pattern = re.compile(re.escape(output.stem) + r"(?:-\d+|_\d{8}_\d{6})" + re.escape(output.suffix))
+            candidates.extend(sorted(p for p in output.parent.iterdir() if pattern.fullmatch(p.name)))
+        for candidate in candidates:
+            if not candidate.is_file():
                 continue
-            print(f"Preserving invalid existing output: {output} ({detail})", file=sys.stderr)
-        pending.append(url)
+            valid, detail = verify_existing_output(ffmpeg, candidate, url, getattr(args, "duration", None))
+            if valid:
+                print(f"Skipping verified existing output: {candidate}", file=sys.stderr)
+                break
+            print(f"Preserving unverified existing output: {candidate} ({detail})", file=sys.stderr)
+        else:
+            pending.append(url)
     return pending
 
 
@@ -776,7 +867,7 @@ def download_one(args: argparse.Namespace, ffmpeg: str, url: str, output: Path, 
         args.playlist_probe_timeout,
     )
     print("Captured m3u8:", m3u8_url, file=sys.stderr)
-    return run_ffmpeg(ffmpeg, m3u8_url, headers, output, args.duration, args.overwrite)
+    return run_ffmpeg(ffmpeg, m3u8_url, headers, output, args.duration, args.overwrite, page_url=url)
 
 
 def main() -> int:
@@ -784,6 +875,8 @@ def main() -> int:
         description="Capture an m3u8 curl command from a page URL and download the stream."
     )
     parser.add_argument("urls", nargs="*", help="Page URL(s) to open in the capture browser.")
+    parser.add_argument("--expected-count", type=int,
+                        help="Require this many unique queued items before any download or success report.")
     parser.add_argument(
         "-o",
         "--output",
@@ -992,7 +1085,7 @@ def main() -> int:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip URLs whose normal output file already exists and is non-empty.",
+        help="Skip only existing files with matching completion receipts and a clean full-file decode.",
     )
     args = parser.parse_args()
 
@@ -1044,6 +1137,11 @@ def main() -> int:
         except ValueError as exc:
             parser.error(str(exc))
 
+    urls = list(dict.fromkeys(urls))
+    if args.expected_count is not None and (args.expected_count < 1 or len(urls) != args.expected_count):
+        parser.error(f"expected {args.expected_count} unique items, but resolved {len(urls)}")
+    if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0):
+        parser.error("--duration must be finite and positive")
     if args.dry_run_urls:
         for url in urls:
             print(url)
@@ -1062,7 +1160,7 @@ def main() -> int:
         original_count = len(urls)
         urls = skip_existing_urls(args, urls, multiple)
         if not urls:
-            print(f"All {original_count} URL(s) already have output files.", file=sys.stderr)
+            print(f"All {original_count} requested items passed receipt, duration, and full-decode verification.", file=sys.stderr)
             return 0
         skipped = original_count - len(urls)
         if skipped:
@@ -1109,7 +1207,14 @@ def main() -> int:
         if failures:
             print(f"\nCompleted with {failures} failure(s) out of {len(urls)} URL(s).", file=sys.stderr)
             return 1
-        print(f"\nCompleted {len(urls)} URL(s).", file=sys.stderr)
+        # Audit every new output, even if a worker incorrectly returned zero.
+        for url, output in zip(urls, outputs):
+            valid, detail = verify_existing_output(ffmpeg, output, url, args.duration, decode=False)
+            if not valid:
+                print(f"Final verification failed: {output} ({detail})", file=sys.stderr)
+                return 1
+        label = "requested clips" if args.duration is not None else "requested items"
+        print(f"\nVerified all {label}: {len(urls)} newly saved; all skipped files also verified.", file=sys.stderr)
         return 0
     except KeyboardInterrupt:
         print("\nStopped.", file=sys.stderr)
