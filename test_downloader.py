@@ -26,8 +26,10 @@ def make_args(**overrides):
 
 
 class AutomaticExpansionTests(unittest.TestCase):
-    @mock.patch.object(downloader.subprocess, "call", return_value=0)
-    def test_ffmpeg_allows_extensionless_hls_segments_before_input(self, call):
+    @mock.patch.object(downloader, "media_metadata", return_value={})
+    @mock.patch.object(downloader, "ffprobe_for_ffmpeg", return_value="ffprobe")
+    @mock.patch.object(downloader.subprocess, "run", return_value=mock.Mock(returncode=7))
+    def test_ffmpeg_allows_extensionless_hls_segments_before_input(self, call, probe, metadata):
         with tempfile.TemporaryDirectory() as directory:
             output = downloader.Path(directory) / "episode.mp4"
 
@@ -40,7 +42,7 @@ class AutomaticExpansionTests(unittest.TestCase):
                 False,
             )
 
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 7)
         command = call.call_args.args[0]
         option_index = command.index("-allowed_segment_extensions")
         picky_index = command.index("-extension_picky")
@@ -194,7 +196,9 @@ class AutomaticExpansionTests(unittest.TestCase):
         )
         self.assertFalse(discover.call_args.args[0].discover_dropdowns)
 
-    def test_skip_existing_urls_keeps_only_missing_outputs(self):
+    @mock.patch.object(downloader, "validate_media_file", return_value=(True, "valid"))
+    @mock.patch.object(downloader, "ffprobe_for_ffmpeg", return_value="ffprobe")
+    def test_skip_existing_urls_keeps_only_missing_outputs(self, probe, validate):
         with tempfile.TemporaryDirectory() as directory:
             args = make_args(output=downloader.Path(directory))
             urls = [
