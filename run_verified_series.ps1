@@ -9,6 +9,9 @@ param(
 $ErrorActionPreference = 'Stop'
 $env:PATH = "$env:LOCALAPPDATA\Microsoft\WinGet\Links;" + $env:PATH
 if (!(Test-Path -LiteralPath $QueueFile -PathType Leaf)) { throw 'Queue file is missing' }
+# Windows PowerShell 5 treats redirected native stderr as ErrorRecords, even
+# when FFmpeg is only printing progress. The process exit code is authoritative.
+$ErrorActionPreference = 'Continue'
 & $Python -u (Join-Path $PSScriptRoot 'download_from_captured_m3u8.py') `
     --url-file $QueueFile --expected-count $ExpectedCount --output $Output `
     --no-auto-expand --no-discover-dropdowns --no-top-right-click --parallel 1 `
