@@ -101,3 +101,13 @@ Add `--apply --log .\work\rename-log.json` after reviewing the preview. Existing
 destinations are never overwritten; collisions are skipped and written to the log.
 Apply mode supports Windows, Linux, and macOS on filesystems with atomic
 no-replace rename support. If that support is unavailable, it stops safely.
+
+## JetKVM-selected movie or episode
+
+For a title already selected visually through JetKVM, use the [combined search, season/episode and download flow](JETKVM_FLOW.md):
+
+```powershell
+python .\download_selected.py 'EXACT_VERIFIED_PLAYER_URL'
+```
+
+The default is a one-URL preview without opening a browser. Add `--execute --output 'D:\Media Downloads'` to download the selected item. This entry point preserves the full episode fragment and disables automatic series expansion and blind popup clicks. It does not share the interactive Chrome profile automatically.
